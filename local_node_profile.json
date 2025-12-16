@@ -1,0 +1,16 @@
+{
+  "node_id": "9584ff4b5ed0a916",
+  "capability_data": {
+    "cpu_score": 27875,
+    "bandwidth_mbps": 1.48,
+    "decompression_speed": 390,
+    "system_info": {
+      "cpu_name": "AMD Ryzen 9 7945HX with Radeon Graphics",
+      "cpu_cores": 16,
+      "cpu_threads": 32,
+      "total_memory_gb": 31.69
+    },
+    "latency_requirement": 400
+  },
+  "last_updated": 1765870074.1707158
+}
