@@ -11,8 +11,10 @@
 
 import json
 import os
+import tarfile
 import math
 from collections import defaultdict
+from typing import Dict, Any, List
 
 
 class ImageProbe:
@@ -51,9 +53,98 @@ class ImageProbe:
         """
         遍历每个layer进行分析
         """
-        # TODO: 实现layer分析逻辑
-        # 流式解压tar包，分析文件类型和可压缩属性
-        pass
+        layer_profiles = []
+        
+        for layer_path in self.layers:
+            full_layer_path = os.path.join(self.image_path, layer_path)
+            if os.path.exists(full_layer_path):
+                layer_profile = self._analyze_single_layer(full_layer_path)
+                layer_profiles.append(layer_profile)
+        
+        return layer_profiles
+    
+    def _analyze_single_layer(self, layer_path):
+        """
+        分析单个layer
+        
+        Args:
+            layer_path: layer文件路径
+            
+        Returns:
+            layer_profile: 包含该层分析结果的字典
+        """
+        layer_profile = {
+            "layer_path": layer_path,
+            "size": os.path.getsize(layer_path),
+            "avg_entropy": 0,
+            "file_type_distribution": {},
+            "text_ratio": 0,
+            "binary_ratio": 0,
+            "compressed_ratio": 0
+        }
+        
+        try:
+            # 尝试作为tar文件处理
+            with tarfile.open(layer_path, 'r') as tar:
+                entropy_sum = 0
+                file_count = 0
+                file_type_counts = defaultdict(int)
+                total_size = 0
+                text_size = 0
+                binary_size = 0
+                
+                for member in tar.getmembers():
+                    if member.isfile():
+                        f = tar.extractfile(member)
+                        if f:
+                            content = f.read()
+                            if content:
+                                # 计算文件熵
+                                entropy = self.calculate_entropy(content)
+                                entropy_sum += entropy
+                                file_count += 1
+                                
+                                # 分析文件类型
+                                file_type = self._detect_file_type(content, member.name)
+                                file_type_counts[file_type] += 1
+                                
+                                # 统计文本/二进制大小
+                                if file_type == "text":
+                                    text_size += len(content)
+                                else:
+                                    binary_size += len(content)
+                                
+                                total_size += len(content)
+                
+                if file_count > 0:
+                    layer_profile["avg_entropy"] = entropy_sum / file_count
+                layer_profile["file_type_distribution"] = dict(file_type_counts)
+                
+                if total_size > 0:
+                    layer_profile["text_ratio"] = text_size / total_size
+                    layer_profile["binary_ratio"] = binary_size / total_size
+        except tarfile.ReadError:
+            # 如果不是tar文件，直接分析整个文件
+            with open(layer_path, 'rb') as f:
+                content = f.read()
+                if content:
+                    # 计算整个文件的熵
+                    entropy = self.calculate_entropy(content)
+                    layer_profile["avg_entropy"] = entropy
+                    
+                    # 检测文件类型
+                    file_type = self._detect_file_type(content, layer_path)
+                    layer_profile["file_type_distribution"] = {file_type: 1}
+                    
+                    # 设置文本/二进制比例
+                    if file_type == "text":
+                        layer_profile["text_ratio"] = 1.0
+                        layer_profile["binary_ratio"] = 0.0
+                    else:
+                        layer_profile["text_ratio"] = 0.0
+                        layer_profile["binary_ratio"] = 1.0
+        
+        return layer_profile
     
     def calculate_entropy(self, data):
         """
@@ -84,14 +175,33 @@ class ImageProbe:
         # 归一化到0-1范围 (理论上最大熵是8位字节的最大熵log2(256)=8)
         return entropy / 8.0 if entropy > 0 else 0
     
-    def analyze_file_types(self):
+    def _detect_file_type(self, content, filename):
         """
-        分析文件类型分布
-        统计文本/二进制/已压缩文件比例
+        检测文件类型
+        
+        Args:
+            content: 文件内容
+            filename: 文件名
+            
+        Returns:
+            file_type: 文件类型
         """
-        # TODO: 实现文件类型分析逻辑
-        # 根据文件扩展名或内容特征判断文件类型
-        pass
+        # 根据文件扩展名判断
+        if filename.endswith(('.txt', '.json', '.yaml', '.yml', '.xml', '.html', '.js', '.py', '.java', '.cpp', '.c', '.h')):
+            return "text"
+        
+        # 检查是否为文本内容（基于可打印字符比例）
+        try:
+            text_content = content.decode('utf-8', errors='ignore')
+            printable_chars = sum(1 for c in text_content if c.isprintable() or c.isspace())
+            printable_ratio = printable_chars / len(text_content) if text_content else 0
+            
+            if printable_ratio > 0.9:
+                return "text"
+            else:
+                return "binary"
+        except:
+            return "binary"
     
     def get_image_profile(self):
         """
@@ -100,33 +210,41 @@ class ImageProbe:
         # 解析镜像结构
         self.parse_image_structure()
         
-        # TODO: 实际分析各层数据
-        # 目前返回模拟数据
+        # 分析各层
+        layer_profiles = self.analyze_layers()
         
-        return {
-            "layer_count": len(self.layers),
-            "total_size_mb": 742,  # 模拟数据
-            "avg_layer_entropy": 0.78,
-            "text_ratio": 0.18,
-            "binary_ratio": 0.82,
-            "compressed_file_ratio": 0.12,
-            "avg_file_size_kb": 42.3,
-            "median_file_size_kb": 8.1,
-            "small_file_ratio": 0.67,
-            "big_file_ratio": 0.15,
-            "predict_popularity": 0.54
+        # 汇总镜像整体特征
+        total_size = sum(layer["size"] for layer in layer_profiles)
+        avg_entropy = sum(layer["avg_entropy"] for layer in layer_profiles) / len(layer_profiles) if layer_profiles else 0
+        total_text_size = sum(
+            layer["size"] * layer["text_ratio"] for layer in layer_profiles
+        )
+        total_binary_size = sum(
+            layer["size"] * layer["binary_ratio"] for layer in layer_profiles
+        )
+        text_ratio = total_text_size / total_size if total_size > 0 else 0
+        binary_ratio = total_binary_size / total_size if total_size > 0 else 0
+        
+        # 合并所有文件类型分布
+        file_type_dist = defaultdict(int)
+        for layer in layer_profiles:
+            for file_type, count in layer["file_type_distribution"].items():
+                file_type_dist[file_type] += count
+        
+        total_files = sum(file_type_dist.values())
+        file_type_distribution = {
+            file_type: count / total_files if total_files > 0 else 0
+            for file_type, count in file_type_dist.items()
         }
-
-
-def main():
-    """测试镜像探针"""
-    # 假设镜像数据在temp/image_extract目录下
-    probe = ImageProbe("temp/image_extract")
-    profile = probe.get_image_profile()
-    print("镜像探针结果:")
-    for key, value in profile.items():
-        print(f"  {key}: {value}")
-
-
-if __name__ == "__main__":
-    main()
+        
+        image_profile = {
+            "total_size_mb": total_size / (1024 * 1024),
+            "avg_layer_entropy": avg_entropy,
+            "text_ratio": text_ratio,
+            "binary_ratio": binary_ratio,
+            "file_type_distribution": file_type_distribution,
+            "layer_count": len(layer_profiles),
+            "layers": layer_profiles
+        }
+        
+        return image_profile

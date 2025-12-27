@@ -22,6 +22,10 @@ class NodeCapability:
     system_info: Dict[str, Any] = None
     last_updated: float = 0.0
     confidence: float = 0.5  # 置信度
+    # 新增客户端画像字段
+    network_rtt: float = 0.0      # 网络往返时间 (ms)
+    disk_io_speed: float = 0.0    # 磁盘I/O速度 (MB/s)
+    memory_size: int = 0          # 内存大小 (MB)
 
 
 class CapabilityRegistry:
@@ -54,6 +58,10 @@ class CapabilityRegistry:
                 capability.decompression_speed = capability_data.get("decompression_speed", capability.decompression_speed)
                 capability.system_info = capability_data.get("system_info", capability.system_info)
                 capability.confidence = min(1.0, capability.confidence + 0.1)  # 增加置信度
+                # 更新新增字段
+                capability.network_rtt = capability_data.get("network_rtt", capability.network_rtt)
+                capability.disk_io_speed = capability_data.get("disk_io_speed", capability.disk_io_speed)
+                capability.memory_size = capability_data.get("memory_size", capability.memory_size)
             else:
                 # 创建新画像
                 capability = NodeCapability(
@@ -62,7 +70,11 @@ class CapabilityRegistry:
                     bandwidth_mbps=capability_data.get("bandwidth_mbps", 10.0),
                     decompression_speed=capability_data.get("decompression_speed", {"gzip": 50, "zstd": 100}),
                     system_info=capability_data.get("system_info"),
-                    confidence=0.8
+                    confidence=0.8,
+                    # 初始化新增字段
+                    network_rtt=capability_data.get("network_rtt", 0.0),
+                    disk_io_speed=capability_data.get("disk_io_speed", 0.0),
+                    memory_size=capability_data.get("memory_size", 0)
                 )
                 self.capabilities[node_id] = capability
             
@@ -121,47 +133,42 @@ class CapabilityRegistry:
             }
         
         return {
+            "node_id": capability.node_id,
             "cpu_score": capability.cpu_score,
             "bandwidth_mbps": capability.bandwidth_mbps,
             "decompression_speed": capability.decompression_speed or {"gzip": 50, "zstd": 100},
+            "network_rtt": capability.network_rtt,
+            "disk_io_speed": capability.disk_io_speed,
+            "memory_size": capability.memory_size,
+            "confidence": capability.confidence,
             "latency_requirement": 400
         }
     
     def _load_registry(self):
-        """加载已注册的能力画像"""
-        try:
-            if os.path.exists(self.registry_path):
-                with open(self.registry_path, 'r') as f:
+        """从文件加载能力注册表"""
+        if os.path.exists(self.registry_path):
+            try:
+                with open(self.registry_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     for node_id, cap_data in data.items():
-                        # 处理decompression_speed可能是字符串的问题
-                        if isinstance(cap_data.get("decompression_speed"), str):
-                            try:
-                                cap_data["decompression_speed"] = json.loads(cap_data["decompression_speed"])
-                            except:
-                                cap_data["decompression_speed"] = {"gzip": 50, "zstd": 100}
-                        
-                        self.capabilities[node_id] = NodeCapability(**cap_data)
-        except Exception as e:
-            print(f"加载能力注册表失败: {e}")
+                        # 直接从字典重建对象，dataclass会处理类型
+                        capability = NodeCapability(**cap_data)
+                        self.capabilities[node_id] = capability
+            except Exception as e:
+                print(f"加载能力注册表失败: {e}")
     
     def _save_registry(self):
-        """保存能力注册表"""
+        """保存能力注册表到文件"""
         try:
             # 确保目录存在
             os.makedirs(os.path.dirname(self.registry_path), exist_ok=True)
             
-            # 转换为可序列化格式
             data = {}
             for node_id, capability in self.capabilities.items():
-                cap_dict = asdict(capability)
-                # 确保decompression_speed是可序列化的
-                if isinstance(cap_dict.get("decompression_speed"), dict):
-                    cap_dict["decompression_speed"] = json.dumps(cap_dict["decompression_speed"])
-                data[node_id] = cap_dict
+                data[node_id] = asdict(capability)
             
-            with open(self.registry_path, 'w') as f:
-                json.dump(data, f, indent=2)
+            with open(self.registry_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"保存能力注册表失败: {e}")
     
@@ -186,6 +193,16 @@ class CapabilityRegistry:
             
             if expired_nodes:
                 self._save_registry()
+
+    def get_all_capabilities(self) -> Dict[str, NodeCapability]:
+        """
+        获取所有节点能力画像
+        
+        Returns:
+            所有节点能力画像字典
+        """
+        with self.lock:
+            return self.capabilities.copy()
 
 
 def main():

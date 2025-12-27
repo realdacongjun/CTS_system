@@ -17,7 +17,7 @@ from typing import List, Dict, Any
 class DockerAnalyzer:
     """Docker镜像分析器"""
 # 构造函数
-    def __init__(self, work_dir: str = "image"):
+    def __init__(self, work_dir: str = "temp/image"):
         """
         初始化Docker镜像分析器
         

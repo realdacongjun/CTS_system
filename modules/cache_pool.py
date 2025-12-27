@@ -1,5 +1,19 @@
 """
-多格式缓存池（Compression Cache Pool）
+压缩缓存池（Compression Cache Pool）
+目的：缓存已压缩的镜像层，避免重复压缩
+"""
+
+
+import os
+import json
+import hashlib
+from typing import Dict, Any, Optional, List
+from pathlib import Path
+import time
+from collections import OrderedDict
+
+"""
+压缩缓存池（Compression Cache Pool）
 目的：存储同一镜像的多种压缩格式，提高响应速度
 
 目录结构示例：
@@ -12,197 +26,277 @@ cache/
 """
 
 
-import os
-import shutil
-from collections import OrderedDict
-
-
 class LRUCache:
-    """LRU缓存实现"""
+    """LRU缓存实现，增加热度分值和预测权重"""
     
-    def __init__(self, capacity=100):
+    def __init__(self, capacity: int):
         self.cache = OrderedDict()
         self.capacity = capacity
     
-    def get(self, key):
+    def get(self, key: str):
         if key not in self.cache:
             return None
-        # 移动到末尾表示最近使用
+        # 更新使用时间戳
         self.cache.move_to_end(key)
         return self.cache[key]
     
-    def put(self, key, value):
+    def put(self, key: str, value: Any):
         if key in self.cache:
-            # 更新现有键值
-            self.cache.move_to_end(key)
-        elif len(self.cache) >= self.capacity:
-            # 删除最久未使用的项
-            self.cache.popitem(last=False)
-        self.cache[key] = value
+            # 更新热度分值
+            current_value = self.cache[key]
+            current_value['data'] = value['data']
+            current_value['last_access'] = time.time()
+            current_value['hotness_score'] = current_value.get('hotness_score', 0) + 1
+        else:
+            # 新增缓存项，初始热度为1
+            self.cache[key] = {
+                'data': value['data'],
+                'last_access': time.time(),
+                'hotness_score': 1,
+                'access_count': 1,
+                'predicted_value': value.get('predicted_value', 0.5),  # 预测价值分值
+                'compression_time_saved': value.get('compression_time_saved', 0),  # 预估节省的压缩时间
+                'transfer_time_saved': value.get('transfer_time_saved', 0)  # 预估节省的传输时间
+            }
+        
+        self.cache.move_to_end(key)
+        
+        if len(self.cache) > self.capacity:
+            # 根据热度、预测价值和节省时间的综合权重排序，移除最不重要的项
+            # 权重计算：cache_weight = (hotness_score + predicted_value + time_saved_factor) / 3
+            def calculate_cache_weight(item):
+                hotness = item[1]['hotness_score']
+                predicted = item[1]['predicted_value']
+                time_saved_factor = (item[1]['compression_time_saved'] + item[1]['transfer_time_saved']) / 2
+                return (hotness + predicted + time_saved_factor) / 3
+            
+            sorted_items = sorted(self.cache.items(), key=calculate_cache_weight)
+            lru_key = sorted_items[0][0]
+            del self.cache[lru_key]
 
 
 class CompressionCachePool:
     """压缩缓存池"""
     
-    def __init__(self, cache_root="cache"):
+    def __init__(self, cache_root: str = "cache/"):
         self.cache_root = cache_root
-        self.lru_cache = LRUCache(1000)  # 内存中的LRU缓存
-        # 确保缓存根目录存在
-        if not os.path.exists(cache_root):
-            os.makedirs(cache_root)
+        self.lru_cache = LRUCache(1000)  # LRU缓存，容量1000
+        os.makedirs(self.cache_root, exist_ok=True)
     
-    def get_cache_path(self, image_name, compression_method):
+    def cache_layer_data(self, image_name: str, layer_digest: str, compression_method: str, layer_data: bytes, 
+                        predicted_value: float = 0.5, compression_time_saved: float = 0.0, transfer_time_saved: float = 0.0):
         """
-        获取镜像特定压缩格式的缓存路径
+        缓存压缩后的层数据
         
         Args:
             image_name: 镜像名称
+            layer_digest: 层摘要
             compression_method: 压缩方法
-            
-        Returns:
-            path: 缓存路径
+            layer_data: 层数据
+            predicted_value: 预测价值分值（来自访问预测器）
+            compression_time_saved: 预估节省的压缩时间
+            transfer_time_saved: 预估节省的传输时间
         """
-        # 清理镜像名称中的特殊字符
+        # 清理镜像名称以适合作为文件名
         clean_image_name = image_name.replace("/", "_").replace(":", "_")
-        return os.path.join(self.cache_root, clean_image_name, compression_method)
+        
+        # 创建缓存目录
+        layer_cache_dir = os.path.join(
+            self.cache_root,
+            clean_image_name,
+            "layers",
+            layer_digest,
+            compression_method
+        )
+        os.makedirs(layer_cache_dir, exist_ok=True)
+        
+        # 保存压缩数据
+        cache_path = os.path.join(layer_cache_dir, "data")
+        with open(cache_path, "wb") as f:
+            f.write(layer_data)
+        
+        # 更新LRU缓存
+        cache_key = f"{image_name}:{layer_digest}:{compression_method}"
+        self.lru_cache.put(cache_key, {
+            'data': layer_data,
+            'predicted_value': predicted_value,
+            'compression_time_saved': compression_time_saved,
+            'transfer_time_saved': transfer_time_saved
+        })
     
-    def is_cached(self, image_name, compression_method):
+    def get_cached_layer_data(self, image_name: str, layer_digest: str, compression_method: str) -> Optional[bytes]:
         """
-        检查特定压缩格式是否已缓存
+        获取缓存的压缩层数据
         
         Args:
             image_name: 镜像名称
+            layer_digest: 层摘要
             compression_method: 压缩方法
             
         Returns:
-            bool: 是否已缓存
+            层数据或None
         """
-        cache_key = f"{image_name}:{compression_method}"
-        # 先检查内存LRU缓存
-        if self.lru_cache.get(cache_key) is not None:
-            return True
-            
-        # 检查磁盘缓存
-        cache_path = self.get_cache_path(image_name, compression_method)
-        exists = os.path.exists(cache_path)
+        # 检查LRU缓存
+        cache_key = f"{image_name}:{layer_digest}:{compression_method}"
+        cached_item = self.lru_cache.get(cache_key)
+        if cached_item:
+            # 更新热度分值
+            cached_item['hotness_score'] = cached_item.get('hotness_score', 0) + 1
+            cached_item['access_count'] = cached_item.get('access_count', 0) + 1
+            cached_item['last_access'] = time.time()
+            return cached_item['data']
         
-        if exists:
-            # 添加到内存LRU缓存
-            self.lru_cache.put(cache_key, True)
-            
-        return exists
-    
-    def get_cached_data(self, image_name, compression_method):
-        """
-        获取缓存的数据
+        # 从文件系统加载
+        clean_image_name = image_name.replace("/", "_").replace(":", "_")
+        cache_path = os.path.join(
+            self.cache_root,
+            clean_image_name,
+            "layers",
+            layer_digest,
+            compression_method,
+            "data"
+        )
         
-        Args:
-            image_name: 镜像名称
-            compression_method: 压缩方法
-            
-        Returns:
-            data: 缓存数据路径，如果不存在返回None
-        """
-        if not self.is_cached(image_name, compression_method):
-            return None
-            
-        cache_path = self.get_cache_path(image_name, compression_method)
         if os.path.exists(cache_path):
-            # 更新LRU缓存
-            cache_key = f"{image_name}:{compression_method}"
-            self.lru_cache.put(cache_key, True)
-            return cache_path
+            with open(cache_path, "rb") as f:
+                data = f.read()
             
+            # 添加到LRU缓存
+            self.lru_cache.put(cache_key, {
+                'data': data,
+                'predicted_value': 0.5  # 默认预测价值
+            })
+            
+            return data
+        
         return None
     
-    def cache_data(self, image_name, compression_method, data_path):
+    def is_layer_cached(self, image_name: str, layer_digest: str, compression_method: str) -> bool:
         """
-        缓存数据
+        检查层是否已缓存
         
         Args:
             image_name: 镜像名称
+            layer_digest: 层摘要
             compression_method: 压缩方法
-            data_path: 数据路径
-        """
-        cache_path = self.get_cache_path(image_name, compression_method)
-        
-        # 确保目录存在
-        cache_dir = os.path.dirname(cache_path)
-        if not os.path.exists(cache_dir):
-            os.makedirs(cache_dir)
-        
-        # 复制数据到缓存位置
-        if os.path.exists(data_path):
-            if os.path.isdir(data_path):
-                shutil.copytree(data_path, cache_path)
-            else:
-                shutil.copy2(data_path, cache_path)
             
-            # 更新LRU缓存
-            cache_key = f"{image_name}:{compression_method}"
-            self.lru_cache.put(cache_key, True)
-    
-    def invalidate_cache(self, image_name=None, compression_method=None):
+        Returns:
+            是否已缓存
         """
-        使缓存失效
+        return self.get_cached_layer_data(image_name, layer_digest, compression_method) is not None
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """
+        获取缓存统计信息
+        
+        Returns:
+            缓存统计信息
+        """
+        total_size = 0
+        total_layers = 0
+        
+        for root, dirs, files in os.walk(self.cache_root):
+            for file in files:
+                file_path = os.path.join(root, file)
+                total_size += os.path.getsize(file_path)
+            total_layers += len(dirs)
+        
+        return {
+            "total_size_bytes": total_size,
+            "total_layers": total_layers,
+            "cached_items_count": len(self.lru_cache.cache),
+            "cache_path": self.cache_root
+        }
+    
+    def update_hotness_score(self, image_name: str, layer_digest: str, compression_method: str):
+        """
+        手动更新缓存项的热度分值
         
         Args:
-            image_name: 镜像名称，如果为None则清除所有
-            compression_method: 压缩方法，如果为None则清除该镜像的所有格式
+            image_name: 镜像名称
+            layer_digest: 层摘要
+            compression_method: 压缩方法
         """
-        if image_name is None:
-            # 清除所有缓存
-            if os.path.exists(self.cache_root):
-                shutil.rmtree(self.cache_root)
-                os.makedirs(self.cache_root)
-            self.lru_cache = LRUCache(1000)
-            return
+        cache_key = f"{image_name}:{layer_digest}:{compression_method}"
+        cached_item = self.lru_cache.get(cache_key)
+        if cached_item:
+            cached_item['hotness_score'] = cached_item.get('hotness_score', 0) + 1
+            cached_item['access_count'] = cached_item.get('access_count', 0) + 1
+            cached_item['last_access'] = time.time()
+    
+    def get_hotness_score(self, image_name: str, layer_digest: str, compression_method: str) -> int:
+        """
+        获取缓存项的热度分值
         
-        if compression_method is None:
-            # 清除特定镜像的所有缓存
-            clean_image_name = image_name.replace("/", "_").replace(":", "_")
-            image_cache_dir = os.path.join(self.cache_root, clean_image_name)
-            if os.path.exists(image_cache_dir):
-                shutil.rmtree(image_cache_dir)
-        else:
-            # 清除特定镜存
-            cache_path = self.get_cache_path(image_name, compression_method)
-            if os.path.exists(cache_path):
-                if os.path.isdir(cache_path):
-                    shutil.rmtree(cache_path)
-                else:
-                    os.remove(cache_path)
+        Args:
+            image_name: 镜像名称
+            layer_digest: 层摘要
+            compression_method: 压缩方法
+            
+        Returns:
+            热度分值
+        """
+        cache_key = f"{image_name}:{layer_digest}:{compression_method}"
+        cached_item = self.lru_cache.get(cache_key)
+        if cached_item:
+            return cached_item.get('hotness_score', 0)
+        return 0
+    
+    def get_predicted_value(self, image_name: str, layer_digest: str, compression_method: str) -> float:
+        """
+        获取缓存项的预测价值分值
         
-        # 清理LRU缓存中相关的条目
-        keys_to_remove = []
-        for key in self.lru_cache.cache.keys():
-            if key.startswith(f"{image_name}:"):
-                if compression_method is None or key.endswith(f":{compression_method}"):
-                    keys_to_remove.append(key)
+        Args:
+            image_name: 镜像名称
+            layer_digest: 层摘要
+            compression_method: 压缩方法
+            
+        Returns:
+            预测价值分值
+        """
+        cache_key = f"{image_name}:{layer_digest}:{compression_method}"
+        cached_item = self.lru_cache.get(cache_key)
+        if cached_item:
+            return cached_item.get('predicted_value', 0.5)
+        return 0.5
+    
+    def set_predicted_value(self, image_name: str, layer_digest: str, compression_method: str, predicted_value: float):
+        """
+        设置缓存项的预测价值分值
         
-        for key in keys_to_remove:
-            self.lru_cache.cache.pop(key, None)
+        Args:
+            image_name: 镜像名称
+            layer_digest: 层摘要
+            compression_method: 压缩方法
+            predicted_value: 预测价值分值
+        """
+        cache_key = f"{image_name}:{layer_digest}:{compression_method}"
+        cached_item = self.lru_cache.get(cache_key)
+        if cached_item:
+            cached_item['predicted_value'] = predicted_value
+    
+    def get_cache_weight(self, image_name: str, layer_digest: str, compression_method: str) -> float:
+        """
+        获取缓存项的综合权重
+        
+        Args:
+            image_name: 镜像名称
+            layer_digest: 层摘要
+            compression_method: 压缩方法
+            
+        Returns:
+            综合权重值
+        """
+        cache_key = f"{image_name}:{layer_digest}:{compression_method}"
+        cached_item = self.lru_cache.get(cache_key)
+        if cached_item:
+            hotness = cached_item.get('hotness_score', 0)
+            predicted = cached_item.get('predicted_value', 0.5)
+            time_saved_factor = (cached_item.get('compression_time_saved', 0) + 
+                                cached_item.get('transfer_time_saved', 0)) / 2
+            return (hotness + predicted + time_saved_factor) / 3
+        return 0.0
 
 
-def main():
-    """测试缓存池"""
-    cache_pool = CompressionCachePool()
-    
-    # 测试缓存功能
-    image_name = "ubuntu:latest"
-    compression_method = "zstd-5"
-    
-    print(f"检查 {image_name} 的 {compression_method} 是否已缓存: {cache_pool.is_cached(image_name, compression_method)}")
-    
-    # 模拟缓存数据
-    print("缓存数据...")
-    cache_pool.cache_data(image_name, compression_method, "temp/image_extract")
-    
-    print(f"再次检查是否已缓存: {cache_pool.is_cached(image_name, compression_method)}")
-    
-    cached_path = cache_pool.get_cached_data(image_name, compression_method)
-    print(f"获取缓存数据路径: {cached_path}")
-
-
-if __name__ == "__main__":
-    main()
+# 简化别名
+CachePool = CompressionCachePool
