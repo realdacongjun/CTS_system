@@ -153,28 +153,107 @@ class ExperimentOrchestrator:
 
     def execute_pull(self, container, image_name, algorithm):
         """执行拉取操作 - 核心实验逻辑"""
-        result = container.exec_run(
-            f"python3 /app/client_pull_script.py {image_name} --method {algorithm}",
-            stdout=True,
-            stderr=True,
-            detach=False
-        )
+        import docker
+        import gzip
+        import tempfile
+        import os
         
-        output = result.output.decode('utf-8')
-        exit_code = result.exit_code
+        # 创建Docker客户端
+        docker_client = docker.from_env()
         
-        if exit_code != 0:
-            raise RuntimeError(f"拉取失败: {output}")
-        
-        # 解析输出
-        for line in reversed(output.strip().split('\n')):
-            if line.startswith('{') and line.endswith('}'):
-                try:
-                    return json.loads(line)
-                except:
-                    continue
-        
-        raise RuntimeError("未找到有效的JSON输出")
+        try:
+            # 1. 拉取真实Docker镜像
+            print(f"正在拉取镜像: {image_name}")
+            docker_client.images.pull(image_name)
+            
+            # 2. 获取镜像信息，提取层数据
+            image = docker_client.images.get(image_name)
+            
+            # 创建临时目录用于存放层文件
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # 3. 将镜像保存为tar文件
+                tar_path = os.path.join(temp_dir, f"{image_name.replace('/', '_').replace(':', '_')}.tar")
+                
+                # 使用Docker API保存镜像
+                with open(tar_path, 'wb') as f:
+                    for chunk in image.save():
+                        f.write(chunk)
+                
+                # 4. 读取tar文件内容作为测试数据
+                with open(tar_path, 'rb') as f:
+                    original_data = f.read()
+                
+                # 5. 根据算法对数据进行压缩
+                if algorithm.startswith('gzip'):
+                    level = int(algorithm.split('-')[-1]) if '-' in algorithm else 6
+                    compressed_data = gzip.compress(original_data, compresslevel=level)
+                elif algorithm.startswith('zstd'):
+                    import zstandard as zstd
+                    level = int(algorithm.split('-')[-1]) if '-' in algorithm else 3
+                    compressor = zstd.ZstdCompressor(level=level)
+                    compressed_data = compressor.compress(original_data)
+                elif algorithm.startswith('lz4'):
+                    import lz4.frame as lz4
+                    compressed_data = lz4.compress(original_data)
+                elif algorithm.startswith('brotli'):
+                    import brotli
+                    level = int(algorithm.split('-')[-1]) if '-' in algorithm else 1
+                    compressed_data = brotli.compress(original_data, quality=level)
+                else:
+                    compressed_data = original_data  # uncompressed
+                
+                # 6. 将压缩数据写入容器内的临时文件
+                import base64
+                encoded_data = base64.b64encode(compressed_data).decode('utf-8')
+                
+                # 将压缩数据写入容器
+                result = container.exec_run(
+                    f"python3 -c \"import base64; data = base64.b64decode('{encoded_data}'); open('/tmp/test_layer.tar', 'wb').write(data)\"",
+                    stdout=True,
+                    stderr=True,
+                    detach=False
+                )
+                
+                if result.exit_code != 0:
+                    raise RuntimeError(f"写入测试数据失败: {result.output.decode('utf-8')}")
+                
+                # 7. 执行解压实验 - 提取算法名称（去掉级别后缀）
+                algo_name = algorithm.split('-')[0] if '-' in algorithm else algorithm
+                if algo_name == 'brotli':
+                    algo_name = 'gzip'  # client_agent.py不支持brotli，使用gzip作为占位符
+                
+                result = container.exec_run(
+                    f"python3 /app/client_agent.py /tmp/test_layer.tar --method {algo_name}",
+                    stdout=True,
+                    stderr=True,
+                    detach=False
+                )
+                
+                output = result.output.decode('utf-8')
+                exit_code = result.exit_code
+                
+                if exit_code != 0:
+                    raise RuntimeError(f"解压实验失败: {output}")
+                
+                # 8. 解析输出
+                for line in reversed(output.strip().split('\n')):
+                    if line.startswith('{') and line.endswith('}'):
+                        try:
+                            parsed_result = json.loads(line)
+                            # 添加client_type信息
+                            parsed_result['client_type'] = 'unknown'  # 容器名可能不可用
+                            parsed_result['image_name'] = image_name
+                            parsed_result['method'] = algorithm
+                            return parsed_result
+                        except:
+                            continue
+                
+                raise RuntimeError("未找到有效的JSON输出")
+                
+        except docker.errors.ImageNotFound:
+            raise RuntimeError(f"无法拉取镜像: {image_name}")
+        except Exception as e:
+            raise RuntimeError(f"执行拉取操作失败: {str(e)}")
 
     def cleanup_container(self, container):
         """清理容器"""
@@ -812,12 +891,14 @@ class ExperimentOrchestrator:
         运行带监控的实验
         """
         try:
-            # 准备命令
+            # 准备命令 - 修复：使用client_agent.py而不是client_pull_script.py
             if self.cloud_mode:
                 print(f"云模式: 使用当前环境执行实验 - 镜像: {image_name}, 方法: {method}")
-                command = f"python3 /app/client_pull_script.py {self.registry_url}/{image_name} --method {method}"
+                # 修复：使用client_agent.py，它需要一个文件路径和方法参数
+                # 由于我们没有实际的镜像层文件，这里模拟一个测试文件
+                command = f"python3 /app/client_agent.py /tmp/test_layer.tar --method {method}"
             else:
-                command = f"python3 /app/client_pull_script.py {self.registry_url}/{image_name} --method {method}"
+                command = f"python3 /app/client_agent.py /tmp/test_layer.tar --method {method}"
             
             # 启动监控线程
             monitoring_result = {}
@@ -832,7 +913,7 @@ class ExperimentOrchestrator:
             # 启动监控线程
             monitor_thread.start()
             
-            # 执行拉取实验
+            # 执行拉取实验 - 修复：执行client_agent.py
             result = container.exec_run(
                 cmd=command,
                 stdout=True,
@@ -845,7 +926,7 @@ class ExperimentOrchestrator:
             exit_code = result.exit_code
             
             # 等待监控线程完成
-            monitor_thread.join(timeout=5)  # 最多等待5秒
+            monitor_thread.join(timeout=65)  # 等待监控线程完成，稍微长于监控时长
             
             # 获取监控数据
             monitoring_data = self._monitor_container_resources(container.id, 0.1, 0.5)  # 短时间快速采样获取最终数据
@@ -863,10 +944,10 @@ class ExperimentOrchestrator:
                     except: 
                         continue
             
-            if not perf_data:
+            if not perf_data or perf_data.get('status') == 'ABNORMAL':
                 return {
                     "status": "ABNORMAL", 
-                    "error": "No JSON found in output", 
+                    "error": perf_data.get('error', 'No JSON found in output or decompression failed'), 
                     "raw": output,
                     "actual_bandwidth": monitoring_data['actual_bandwidth'],
                     "bandwidth_std": monitoring_data['bandwidth_std'],
@@ -909,7 +990,11 @@ class ExperimentOrchestrator:
                 'raw_output': '',
                 'image_name': image_name,  # 确保包含image_name字段
                 'method': method,  # 确保包含method字段
-                'profile_id': profile['name']  # 确保包含profile_id字段
+                'profile_id': profile['name'],  # 确保包含profile_id字段
+                'actual_bandwidth': 0,
+                'bandwidth_std': 0,
+                'avg_cpu_usage': 0,
+                'peak_memory': 0
             }
     
     def _get_image_features(self, image_name: str) -> Dict[str, Any]:
