@@ -233,7 +233,27 @@ class ExperimentOrchestrator:
                 exit_code = result.exit_code
                 
                 if exit_code != 0:
-                    raise RuntimeError(f"解压实验失败: {output}")
+                    print(f"解压实验执行失败，退出码: {exit_code}, 输出: {output}")
+                    # 即使执行失败，也尝试解析输出中的JSON（可能包含错误信息）
+                    for line in reversed(output.strip().split('\n')):
+                        if line.startswith('{') and line.endswith('}'):
+                            try:
+                                parsed_result = json.loads(line)
+                                # 添加client_type信息
+                                parsed_result['client_type'] = 'unknown'  # 容器名可能不可用
+                                parsed_result['image_name'] = image_name
+                                parsed_result['method'] = algorithm
+                                return parsed_result
+                            except:
+                                continue
+                    # 如果没有找到JSON输出，则返回错误结果
+                    return {
+                        "status": "ABNORMAL",
+                        "error": f"解压实验执行失败: {output}",
+                        "image_name": image_name,
+                        "method": algorithm,
+                        "profile_id": "unknown"
+                    }
                 
                 # 8. 解析输出
                 for line in reversed(output.strip().split('\n')):
@@ -251,9 +271,23 @@ class ExperimentOrchestrator:
                 raise RuntimeError("未找到有效的JSON输出")
                 
         except docker.errors.ImageNotFound:
-            raise RuntimeError(f"无法拉取镜像: {image_name}")
+            print(f"无法拉取镜像: {image_name}")
+            return {
+                "status": "ABNORMAL",
+                "error": f"无法拉取镜像: {image_name}",
+                "image_name": image_name,
+                "method": algorithm,
+                "profile_id": "unknown"
+            }
         except Exception as e:
-            raise RuntimeError(f"执行拉取操作失败: {str(e)}")
+            print(f"执行拉取操作失败: {str(e)}")
+            return {
+                "status": "ABNORMAL",
+                "error": f"执行拉取操作失败: {str(e)}",
+                "image_name": image_name,
+                "method": algorithm,
+                "profile_id": "unknown"
+            }
 
     def cleanup_container(self, container):
         """清理容器"""
