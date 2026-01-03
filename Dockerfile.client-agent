@@ -1,0 +1,24 @@
+# 基础镜像：必须使用Python 3.7+（推荐3.9）
+FROM python:3.9-slim
+
+# 安装系统依赖（可选，但建议包含）
+RUN apt-get update && apt-get install -y \
+    liblz4-dev \
+    zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装Python依赖（严格遵循项目规范）
+RUN pip install --no-cache-dir \
+    zstandard==0.19.0 \
+    lz4==4.0.0 \
+    psutil==5.9.0 \
+    py-cpuinfo==9.0.0
+
+# 设置工作目录
+WORKDIR /app
+
+# 复制client_agent脚本（必须包含）
+COPY client_agent.py .
+
+# 设置入口点（必须与实验编排器调用方式匹配）
+ENTRYPOINT ["python", "client_agent.py"]

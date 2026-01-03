@@ -1,0 +1,15 @@
+{
+  "62087c3a3fb2e4c8:test_image:latest:gzip-1:1766845031": {
+    "node_id": "62087c3a3fb2e4c8",
+    "image_id": "test_image:latest",
+    "algorithm_used": "gzip-1",
+    "actual_transfer_time": 1.5,
+    "actual_decompression_time": 0.8,
+    "predicted_transfer_time": 0.0,
+    "predicted_decompression_time": 0.0,
+    "compression_ratio": 0.6,
+    "original_size": 0.0,
+    "compressed_size": 0.0,
+    "timestamp": 1766845031.1367352
+  }
+}
