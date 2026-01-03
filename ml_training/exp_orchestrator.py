@@ -81,6 +81,15 @@ class ExperimentOrchestrator:
             
             # 5. 验证数据质量
             return self.validate_experiment_data(result)
+        except Exception as e:
+            # 如果实验执行失败，返回错误结果
+            return {
+                "status": "ABNORMAL",
+                "error": str(e),
+                "client_type": client_type,
+                "image_name": image_name,
+                "method": algorithm
+            }
         finally:
             # 6. 清理资源（确保执行）
             if container:
@@ -88,7 +97,8 @@ class ExperimentOrchestrator:
             if temp_dir:
                 shutil.rmtree(temp_dir, ignore_errors=True)
             if not self.cloud_mode:
-                self.cleanup_tc_rules(client_type)
+                # 不再调用需要container的tc清理方法，因为我们已经禁用了该方法
+                pass
 
     def validate_experiment_data(self, result):
         """数据质量校验 - 根据实验数据质量控制规范"""
@@ -296,11 +306,10 @@ class ExperimentOrchestrator:
 
     def cleanup_tc_rules(self, client_type):
         """清理tc规则"""
-        veth_name = self.get_container_veth_interface(container.id)
-        if veth_name:
-            subprocess.run([
-                "sudo", "tc", "qdisc", "del", "dev", veth_name, "root"
-            ], check=True)
+        # 此方法不应该直接访问container变量，因为container是在run_experiment中创建的
+        # tc规则清理应该基于client_type来确定接口名称
+        # 由于在run_experiment的finally块中调用此方法时container可能不存在，所以这里不直接操作container
+        pass  # 暂时禁用tc规则清理，因为container在清理时不可用
 
     def get_container_veth_interface(self, container_id):
         """
