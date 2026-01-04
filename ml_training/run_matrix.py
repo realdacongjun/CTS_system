@@ -143,6 +143,7 @@ class ExperimentOrchestrator:
             
         return compressed_path, original_size, compressed_size
 
+
     def setup_client_container(self, profile_name):
         """启动特定配置的客户端容器"""
         config = CLIENT_PROFILES[profile_name]
@@ -156,15 +157,19 @@ class ExperimentOrchestrator:
             pass
 
         # 启动新容器 (应用 CPU/Mem 限制)
+        # 启动新容器 (应用 CPU/Mem 限制 + 网络权限)
         container = self.docker_client.containers.run(
             CLIENT_IMAGE,
             name=container_name,
             detach=True,
             tty=True,
-            nano_cpus=int(config['cpu'] * 1e9), # docker py需要纳秒
+            nano_cpus=int(config['cpu'] * 1e9),
             mem_limit=config['mem'],
-            volumes={TEMP_DIR: {'bind': '/data', 'mode': 'rw'}}, # 挂载数据目录
-            command="tail -f /dev/null" # 保持运行，等待exec
+            # === 【新增下面这一行】 ===
+            cap_add=['NET_ADMIN'], 
+            # =========================
+            volumes={TEMP_DIR: {'bind': '/data', 'mode': 'rw'}}, 
+            command="tail -f /dev/null"
         )
         
         # 应用网络仿真 (Pumba)
