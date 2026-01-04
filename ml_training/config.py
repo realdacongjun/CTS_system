@@ -1,15 +1,17 @@
 # config.py
 
-# === 客户端画像定义 (C1-C6) ===
-CLIENT_PROFILES = {
-    'C1': {'cpu': 0.2, 'mem': '512m', 'bw': '2m', 'delay': '100ms', 'desc': '极低性能(IoT/树莓派)'},
-    'C2': {'cpu': 0.5, 'mem': '1g',   'bw': '20m', 'delay': '50ms',  'desc': '低性能(老旧PC)'},
-    'C3': {'cpu': 1.0, 'mem': '2g',   'bw': '5m',  'delay': '20ms',  'desc': '中等性能(普通云主机)'},
-    'C4': {'cpu': 1.5, 'mem': '2g',   'bw': '50m', 'delay': '10ms',  'desc': '中高性能(企业工作站)'},
-    'C5': {'cpu': 0.8, 'mem': '2g',   'bw': '100m','delay': '5ms',   'desc': '高性能(高带宽节点)'},
-    'C6': {'cpu': 4.0, 'mem': '4g',   'bw': '500m','delay': '1ms',   'desc': '顶级性能(计算集群)'},
-}
+# === 修改前 (会报错) ===
+# 'bw': '2m' ... 'bw': '500m'
 
+# === 修改后 (正确写法) ===
+CLIENT_PROFILES = {
+    'C1': {'cpu': 0.2, 'mem': '512m', 'bw': '2mbit',   'delay': '100ms', 'desc': '极低性能'},
+    'C2': {'cpu': 0.5, 'mem': '1g',   'bw': '20mbit',  'delay': '50ms',  'desc': '低性能'},
+    'C3': {'cpu': 1.0, 'mem': '2g',   'bw': '5mbit',   'delay': '20ms',  'desc': '中等性能'},
+    'C4': {'cpu': 1.5, 'mem': '2g',   'bw': '50mbit',  'delay': '10ms',  'desc': '中高性能'},
+    'C5': {'cpu': 0.8, 'mem': '2g',   'bw': '100mbit', 'delay': '5ms',   'desc': '高性能'},
+    'C6': {'cpu': 4.0, 'mem': '4g',   'bw': '500mbit', 'delay': '1ms',   'desc': '顶级性能'},
+}
 # === 目标镜像列表 (18个) ===
 TARGET_IMAGES = [
     # Linux 发行版

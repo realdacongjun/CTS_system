@@ -209,12 +209,17 @@ class ExperimentOrchestrator:
         is_noise = False
         status = 'SUCCESS'
         
+        # ... (前略)
         if error:
             status = 'FAILED'
         else:
-            # 数据质量控制
-            target_bw_mbps = float(CLIENT_PROFILES[profile]['bw'].replace('m', '')) 
+            # === 修改这里 ===
+            # 原代码: target_bw_mbps = float(CLIENT_PROFILES[profile]['bw'].replace('m', '')) 
+            # 新代码: 去掉 'mbit' 后转浮点数
+            target_bw_mbps = float(CLIENT_PROFILES[profile]['bw'].replace('mbit', '')) 
+            
             measured_bw = data.get('bandwidth_measured', 0)
+            # ... (后略)
             
             # 1. 带宽偏差检查 (>50%)
             if abs(measured_bw - target_bw_mbps) / target_bw_mbps > 0.5:
