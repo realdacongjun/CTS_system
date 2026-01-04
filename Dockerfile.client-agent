@@ -1,24 +1,28 @@
-# 基础镜像：必须使用Python 3.7+（推荐3.9）
+# 基础镜像
 FROM python:3.9-slim
 
-# 安装系统依赖（可选，但建议包含）
-RUN apt-get update && apt-get install -y \
+# 1. 换源并安装系统依赖 (增加 brotli 命令行工具以便调试，liblz4-dev 等用于编译)
+RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list && \
+    apt-get update && apt-get install -y \
     liblz4-dev \
     zlib1g-dev \
+    brotli \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装Python依赖（严格遵循项目规范）
-RUN pip install --no-cache-dir \
+# 2. 安装Python依赖 (增加清华源加速，增加 brotli 库)
+RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
     zstandard==0.19.0 \
     lz4==4.0.0 \
     psutil==5.9.0 \
-    py-cpuinfo==9.0.0
+    py-cpuinfo==9.0.0 \
+    brotli==1.0.9
 
 # 设置工作目录
 WORKDIR /app
 
-# 复制client_agent脚本（必须包含）
+# 复制脚本
 COPY client_agent.py .
 
-# 设置入口点（必须与实验编排器调用方式匹配）
-ENTRYPOINT ["python", "client_agent.py"]
+# 3. 【关键修改】让容器默认处于"挂机"状态
+# 这样 orchestrator 才能启动它并通过 exec_run 注入命令
+CMD ["tail", "-f", "/dev/null"]
