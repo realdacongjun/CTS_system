@@ -25,7 +25,7 @@ TARGET_IMAGES = [
     # 应用平台
     'rabbitmq:latest', 'wordpress:latest', 'nextcloud:latest',
     # 应用工具
-    'gradle:latest', 'logstash:latest', 'node:latest'
+    'gradle:latest', 'node:latest'
 ]
 
 # === 压缩算法配置 ===
