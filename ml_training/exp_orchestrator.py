@@ -33,10 +33,49 @@ class ExperimentOrchestrator:
         "C6": {"cpu": 4.0, "memory": "4g", "bandwidth": "500mbit", "rtt": "5ms", "disk_io": "500mb/s"}
     }
     
-    def __init__(self, cloud_mode=False):
-        self.cloud_mode = cloud_mode
-        self.docker_client = docker.from_env()
-        self.check_environment()
+    def __init__(self, 
+                 registry_url: str = "localhost:5000",
+                 data_dir: str = "/tmp/exp_data",
+                 container_image: str = "cts_client:latest",
+                 cloud_mode: bool = False):
+        """
+        初始化实验编排器
+        
+        Args:
+            registry_url: 镜像仓库地址
+            data_dir: 实验数据目录
+            container_image: 客户端容器镜像
+            cloud_mode: 是否在云服务器模式下运行
+        """
+        self.registry_url = registry_url
+        self.data_dir = data_dir
+        self.container_image = container_image
+        self.client = docker.from_env()
+        self.docker_client = docker.from_env()  # 保持原有功能
+        self.cloud_mode = cloud_mode  # 云服务器模式标志
+        
+        # 检查环境兼容性
+        self._check_environment()
+        
+        # 从配置获取实验参数
+        self.client_profiles = get_client_capabilities()['profiles']
+        self.target_images = get_image_profiles()
+        self.compression_methods = get_compression_config()['algorithms']
+        
+        # 创建数据目录
+        Path(self.data_dir).mkdir(parents=True, exist_ok=True)
+        
+        # 创建实验记录数据库
+        self.db_path = os.path.join(self.data_dir, "experiment_manifest.db")
+        self._init_database()
+        
+        # 记录已完成的实验
+        self.completed_experiments = self._load_completed_experiments()
+        
+        # 用于优雅退出
+        self.running = True
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
 
     def check_environment(self):
         """环境依赖预检 - 根据项目规范必须执行"""
@@ -56,6 +95,42 @@ class ExperimentOrchestrator:
         # 检查Pumba（云模式必需）
         if self.cloud_mode and not shutil.which("pumba"):
             raise RuntimeError("云模式需要Pumba，但未安装。请安装: https://github.com/alexei-led/pumba")
+
+    def _check_environment(self):
+        """检查环境兼容性"""
+        import platform
+        
+        # 检查tc命令是否存在 (仅在Linux环境下)
+        if platform.system().lower() == "linux" and not self.cloud_mode:
+            result = subprocess.run(['which', 'tc'], capture_output=True, text=True)
+            if result.returncode != 0:
+                print("⚠️ 未找到tc命令，如果在云环境运行请启用cloud_mode=True")
+        elif not self.cloud_mode:
+            print("⚠️ 当前系统不是Linux，跳过tc命令检查")
+        
+        # 检查Pumba命令是否存在
+        if platform.system().lower() == "linux":
+            result = subprocess.run(['which', 'pumba'], capture_output=True, text=True)
+            if result.returncode != 0 and self.cloud_mode:
+                print("⚠️ 未找到Pumba命令，云模式下网络仿真可能失败")
+        elif self.cloud_mode:
+            print("⚠️ 当前系统不是Linux，跳过Pumba命令检查")
+        
+        # 检查iperf3命令是否存在 (仅在Linux环境下)
+        if platform.system().lower() == "linux" and not self.cloud_mode:
+            result = subprocess.run(['which', 'iperf3'], capture_output=True, text=True)
+            if result.returncode != 0:
+                print("⚠️ 未找到iperf3命令，网络校准功能可能受限")
+        elif not self.cloud_mode:
+            print("⚠️ 当前系统不是Linux，跳过iperf3命令检查")
+        
+        # 检查是否具有sudo权限 (仅在Linux环境下)
+        if platform.system().lower() == "linux" and not self.cloud_mode:
+            result = subprocess.run(['sudo', '-n', 'true'], capture_output=True, text=True)
+            if result.returncode != 0:
+                print("⚠️ 当前用户没有sudo权限，网络仿真可能失败")
+        elif not self.cloud_mode:
+            print("⚠️ 当前系统不是Linux，跳过sudo权限检查")
 
     def run_experiment(self, client_type, image_name, algorithm):
         """执行单个实验，确保资源清理闭环"""
@@ -702,13 +777,15 @@ class ExperimentOrchestrator:
         finally:
             conn.close()
     
-    def _get_host_runtime_metrics(self):
-        """获取宿主机运行时指标"""
-        return {
-            'host_cpu_load': self._get_host_cpu_load(),
-            'host_memory_usage': self._get_host_memory_usage(),
-            'host_disk_io': self._get_host_disk_io()
-        }
+    def _get_host_cpu_load(self):
+        """获取宿主机CPU负载"""
+        import psutil
+        return psutil.getloadavg()[0] / psutil.cpu_count()  # 归一化负载
+    
+    def _get_host_memory_usage(self):
+        """获取宿主机内存使用率"""
+        import psutil
+        return psutil.virtual_memory().percent
     
     def _get_host_disk_io(self) -> float:
         """获取宿主机磁盘IO使用率"""
@@ -727,6 +804,14 @@ class ExperimentOrchestrator:
             return 0.0
         except Exception:
             return 0.0
+
+    def _get_host_runtime_metrics(self):
+        """获取宿主机运行时指标"""
+        return {
+            'host_cpu_load': self._get_host_cpu_load(),
+            'host_memory_usage': self._get_host_memory_usage(),
+            'host_disk_io': self._get_host_disk_io()
+        }
 
     def _collect_experiment_metrics(self, 
                         profile_id: str, 
