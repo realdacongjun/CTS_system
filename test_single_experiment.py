@@ -23,7 +23,9 @@ def test_single_experiment():
         print("警告：此脚本设计用于Linux环境，当前运行环境为：", sys.platform)
         print("在非Linux环境下，网络仿真功能可能不可用")
     
-    # 创建orchestrator实例，不启用云模式以使用完整功能
+    # 创建orchestrator实例，由于Pumba未安装，使用本地模式（tc命令）
+    # 注意：在Pumba未安装的环境中，只能使用本地模式
+    print("⚠️ Pumba 未安装，将使用本地模式运行实验（使用tc命令）")
     orchestrator = ExperimentOrchestrator(cloud_mode=False)
     
     # 定义测试参数 - 规模更小的实验
