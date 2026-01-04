@@ -1,352 +1,314 @@
-"""
-实验矩阵执行器
-执行完整的实验矩阵：6客户端 × 18镜像 × 10算法 × 3重复 = 3240次实验
-"""
-
+import os
+import sys
 import time
 import json
 import sqlite3
+import logging
 import subprocess
-import os
 import shutil
-from pathlib import Path
-from typing import Dict, Any, List
-from .config import get_client_capabilities, get_image_profiles, get_compression_config
-from .exp_orchestrator import ExperimentOrchestrator
-from .data_collector import DataCollector
+import docker
+import numpy as np
+from datetime import datetime
+from config import CLIENT_PROFILES, TARGET_IMAGES, COMPRESSION_METHODS, REPETITIONS, DB_PATH, TEMP_DIR, CLIENT_IMAGE
 
+# === 日志配置 ===
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("experiment.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
-def check_env_support():
-    """
-    检查云服务器环境是否支持实验编排
-    """
-    modules = ["sch_netem", "sch_htb"]
-    for mod in modules:
-        res = subprocess.run(f"sudo modprobe {mod}", shell=True)
-        if res.returncode != 0:
-            print(f"❌ 环境不支持内核模块: {mod}")
-            return False
-    
-    res = subprocess.run("tc -V", shell=True, capture_output=True)
-    if res.returncode != 0:
-        print("❌ 未安装 iproute2 (tc) 工具")
-        return False
+class ExperimentOrchestrator:
+    def __init__(self):
+        self.docker_client = docker.from_env()
+        self.conn = sqlite3.connect(DB_PATH)
+        self._init_db()
+        self._check_dependencies()
         
-    print("✅ 云服务器环境完美支持实验编排！")
-    return True
+        if not os.path.exists(TEMP_DIR):
+            os.makedirs(TEMP_DIR)
 
+    def _init_db(self):
+        """初始化SQLite数据库"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS experiments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                image TEXT,
+                client_profile TEXT,
+                method TEXT,
+                rep_id INTEGER,
+                status TEXT, -- 'SUCCESS', 'FAILED', 'ABNORMAL'
+                download_time REAL,
+                decomp_time REAL,
+                total_time REAL,
+                cpu_usage REAL,
+                mem_usage REAL,
+                compressed_size INTEGER,
+                original_size INTEGER,
+                bandwidth_measured REAL,
+                is_noise BOOLEAN,
+                error_msg TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(image, client_profile, method, rep_id)
+            )
+        ''')
+        self.conn.commit()
 
-def run_experiment_matrix():
-    """执行三级循环实验矩阵，优化为镜像在最外层以减少磁盘占用"""
-    # 初始化数据库
-    conn = sqlite3.connect('experiments.db')
-    cursor = conn.cursor()
-    
-    # 创建状态表
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS experiments (
-            client_type TEXT,
-            image TEXT,
-            algorithm TEXT,
-            status TEXT,
-            result TEXT,
-            PRIMARY KEY (client_type, image, algorithm)
-        )
-    ''')
-    
-    # 插入待执行的实验（如果不存在）
-    for client_type in client_types:
-        for image in images:
-            for algorithm in algorithms:
-                cursor.execute(
-                    'INSERT OR IGNORE INTO experiments VALUES (?, ?, ?, ?, ?)', 
-                    (client_type, image, algorithm, 'PENDING', None)
-                )
-    conn.commit()
-    
-    # 获取待执行的实验
-    cursor.execute('SELECT client_type, image, algorithm FROM experiments WHERE status = "PENDING"')
-    pending_experiments = cursor.fetchall()
-    
-    orchestrator = ExperimentOrchestrator(cloud_mode=True)  # 可配置
-    data_collector = DataCollector()
-    
-    # 优化后的三级循环：镜像 -> 客户端 -> 算法
-    for image in images:
-        print(f"开始处理镜像: {image}")
+    def _check_dependencies(self):
+        """检查环境依赖"""
         try:
-            # 1. 准备该镜像的压缩版本（下载或生成）
-            layer_files = prepare_image_layers(image)  # 假设此函数存在
-            
-            # 2. 针对该镜像执行所有客户端和算法的组合
-            for client_type in client_types:
-                for algorithm in algorithms:
-                    # 检查数据库状态
-                    cursor.execute(
-                        'SELECT status FROM experiments WHERE client_type = ? AND image = ? AND algorithm = ?', 
-                        (client_type, image, algorithm)
-                    )
-                    result = cursor.fetchone()
-                    if result and result[0] == 'SUCCESS':
-                        continue  # 跳过已完成的实验
-                    
-                    # 执行单个实验
-                    result = orchestrator.run_experiment(client_type, image, algorithm)
-                    # 保存结果等操作...
-                    
-            # 3. 处理完一个镜像后，立即清理其所有临时文件，释放磁盘空间
-            cleanup_image_layers(image)
-            print(f"已清理镜像 {image} 的所有临时文件")
-            
+            subprocess.run(['pumba', '--version'], check=True, stdout=subprocess.PIPE)
+            subprocess.run(['tc', '-V'], check=True, stdout=subprocess.PIPE)
+            logger.info("✅ 环境依赖检查通过 (Docker, Pumba, tc)")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            logger.error("❌ 缺少必要的依赖工具 (Pumba 或 tc)，请先安装。")
+            sys.exit(1)
+
+    def _clear_system_cache(self):
+        """清理系统缓存以保证实验准确性"""
+        try:
+            subprocess.run('sync', shell=True)
+            subprocess.run('echo 3 > /proc/sys/vm/drop_caches', shell=True)
         except Exception as e:
-            print(f"处理镜像 {image} 时出错: {e}")
-            raise
-    
-    conn.close()
+            logger.warning(f"无法清理系统缓存 (可能需要sudo): {e}")
 
+    def is_experiment_done(self, image, profile, method, rep):
+        """检查实验是否已经完成（断点续跑）"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT count(*) FROM experiments 
+            WHERE image=? AND client_profile=? AND method=? AND rep_id=? AND status='SUCCESS'
+        ''', (image, profile, method, rep))
+        return cursor.fetchone()[0] > 0
 
-def run_full_experiment_matrix():
-    """
-    运行完整的实验矩阵
-    - 6个客户端配置（C1-C6）
-    - 18个镜像
-    - 10种压缩算法
-    - 每种组合重复3次
-    """
-    print("开始运行完整实验矩阵...")
-    print("实验配置: 6客户端 × 18镜像 × 10算法 × 3重复 = 3240次实验")
-    
-    # 创建实验数据目录
-    data_dir = "/tmp/full_experiment_data"
-    Path(data_dir).mkdir(parents=True, exist_ok=True)
-    
-    # 初始化实验编排器
-    orchestrator = ExperimentOrchestrator(
-        registry_url="localhost:5000",
-        data_dir=data_dir,
-        container_image="cts-system/client-agent:latest",  # 使用正确的镜像名
-        cloud_mode=True  # 在云服务器上运行，tc可用
-    )
-    
-    # 获取完整的实验配置
-    all_client_profiles = get_client_capabilities()['profiles']
-    all_target_images = get_image_profiles()
-    all_compression_methods = get_compression_config()['algorithms']
-    
-    # 选择完整配置
-    selected_profiles = all_client_profiles
-    selected_images = all_target_images
-    # 从所有算法中选择10个代表性算法
-    selected_methods = all_compression_methods[::4][:10]  # 每隔4个取一个，确保覆盖不同算法类型
-    
-    print(f"客户端配置: {[p['name'] for p in selected_profiles]}")
-    print(f"目标镜像: {[i['name'] for i in selected_images[:5]]}... (共{len(selected_images)}个)")
-    print(f"压缩算法: {selected_methods}")
-    
-    # 运行完整实验矩阵
-    all_results = []
-    completed_count = 0
-    total_experiments = len(selected_profiles) * len(selected_images) * len(selected_methods) * 3
-    
-    print(f"预计总实验数: {total_experiments}")
-    
-    for profile in selected_profiles:
-        print(f"\n=== 开始处理客户端配置: {profile['name']} ({profile['description']}) ===")
+    def prepare_image_payload(self, image_name, method_name):
+        """
+        1. 拉取镜像
+        2. 导出为Tar
+        3. 压缩
+        返回: (压缩文件路径, 原始大小, 压缩后大小)
+        """
+        safe_img_name = image_name.replace(':', '_').replace('/', '_')
+        raw_tar_path = os.path.join(TEMP_DIR, f"{safe_img_name}.tar")
         
-        # 启动模拟容器
-        container = orchestrator._setup_emulated_container(profile)
-        if not container:
-            print(f"容器启动失败: {profile['name']}")
-            continue
+        # 1. 拉取镜像
+        logger.info(f"正在拉取镜像: {image_name}")
+        self.docker_client.images.pull(image_name)
         
+        # 2. 导出为Tar (模拟提取镜像层)
+        # 注意：真实场景可能需要提取特定Layer，这里为了简化模拟，导出整个Image Tar作为payload
+        image = self.docker_client.images.get(image_name)
+        with open(raw_tar_path, 'wb') as f:
+            for chunk in image.save():
+                f.write(chunk)
+        
+        original_size = os.path.getsize(raw_tar_path)
+        
+        # 3. 压缩
+        cmd_args = COMPRESSION_METHODS[method_name]
+        # 构造输出文件名 (例如 .tar.gz, .tar.zst)
+        if 'gzip' in method_name: ext = '.gz'
+        elif 'zstd' in method_name: ext = '.zst'
+        elif 'lz4' in method_name: ext = '.lz4'
+        elif 'brotli' in method_name: ext = '.br'
+        else: ext = '.dat'
+        
+        compressed_path = raw_tar_path + ext
+        
+        # 执行压缩命令
+        logger.info(f"正在压缩 ({method_name}): {raw_tar_path} -> {compressed_path}")
+        start_time = time.time()
+        
+        # 针对不同工具的命令适配
+        if 'gzip' in method_name:
+            with open(raw_tar_path, 'rb') as f_in, open(compressed_path, 'wb') as f_out:
+                subprocess.run(cmd_args, stdin=f_in, stdout=f_out, check=True)
+        elif 'brotli' in method_name:
+             with open(raw_tar_path, 'rb') as f_in, open(compressed_path, 'wb') as f_out:
+                subprocess.run(cmd_args, stdin=f_in, stdout=f_out, check=True)
+        else:
+            # zstd 和 lz4 支持直接文件参数
+            subprocess.run(cmd_args + [raw_tar_path, '-o', compressed_path], check=True)
+            
+        compressed_size = os.path.getsize(compressed_path)
+        
+        # 清理原始tar，只保留压缩包
+        if os.path.exists(raw_tar_path):
+            os.remove(raw_tar_path)
+            
+        return compressed_path, original_size, compressed_size
+
+    def setup_client_container(self, profile_name):
+        """启动特定配置的客户端容器"""
+        config = CLIENT_PROFILES[profile_name]
+        container_name = f"cts_worker_{profile_name}"
+        
+        # 清理旧容器
         try:
-            for image in selected_images:
-                for method in selected_methods:
-                    for repetition in range(3):
-                        exp_uuid = f"{profile['name']}_{image['name']}_{method}_rep{repetition}"
-                        
-                        print(f"执行实验 {completed_count + 1}/{total_experiments}: {exp_uuid}")
-                        
-                        try:
-                            # 执行带物理限制的实验 - 修复参数顺序
-                            experiment_record = orchestrator.run_profiled_experiment(
-                                container, 
-                                image['name'], 
-                                method, 
-                                profile
-                            )
-                            
-                            all_results.append(experiment_record)
-                            completed_count += 1
-                            
-                            print(f"实验完成，状态: {experiment_record.get('status', 'UNKNOWN')}")
-                            
-                            # 保存中间结果，防止中断丢失
-                            if completed_count % 10 == 0:
-                                intermediate_file = f"{data_dir}/intermediate_results_{completed_count}.json"
-                                with open(intermediate_file, 'w') as f:
-                                    json.dump(all_results, f, indent=2)
-                                print(f"中间结果已保存: {intermediate_file}")
-                                
-                        except Exception as e:
-                            print(f"实验执行异常: {e}")
-                            # 记录失败的实验
-                            error_record = {
-                                'profile_id': profile['name'],
-                                'image_name': image['name'],
-                                'method': method,
-                                'repetition': repetition,
-                                'status': 'ABNORMAL',
-                                'error_message': str(e)
-                            }
-                            all_results.append(error_record)
-                            completed_count += 1
-        finally:
-            # 清理容器
+            old = self.docker_client.containers.get(container_name)
+            old.remove(force=True)
+        except docker.errors.NotFound:
+            pass
+
+        # 启动新容器 (应用 CPU/Mem 限制)
+        container = self.docker_client.containers.run(
+            CLIENT_IMAGE,
+            name=container_name,
+            detach=True,
+            tty=True,
+            nano_cpus=int(config['cpu'] * 1e9), # docker py需要纳秒
+            mem_limit=config['mem'],
+            volumes={TEMP_DIR: {'bind': '/data', 'mode': 'rw'}}, # 挂载数据目录
+            command="tail -f /dev/null" # 保持运行，等待exec
+        )
+        
+        # 应用网络仿真 (Pumba)
+        # 注意: 需要在宿主机安装 pumba 二进制文件
+        logger.info(f"应用网络限制 ({profile_name}): BW={config['bw']}, Delay={config['delay']}")
+        pumba_cmd = [
+            "pumba", "netem",
+            "--interface", "eth0",
+            "--duration", "5m", 
+            "rate", "--rate", config['bw'],
+            "delay", "--time", config['delay'], "--jitter", "5ms", "--correlation", "0",
+            container_name
+        ]
+        subprocess.run(pumba_cmd, check=True)
+        
+        return container
+
+    def run_agent_in_container(self, container, compressed_file, method_name):
+        """在容器内执行解压测试"""
+        filename = os.path.basename(compressed_file)
+        container_path = f"/data/{filename}"
+        
+        # 构造容器内命令
+        # 假设 client_agent.py 接受: python3 client_agent.py --file <path> --method <method>
+        cmd = f"python3 /app/client_agent.py --file {container_path} --method {method_name}"
+        
+        exec_result = container.exec_run(cmd)
+        output = exec_result.output.decode('utf-8')
+        
+        if exec_result.exit_code != 0:
+            raise Exception(f"Agent Execution Failed: {output}")
+            
+        # 解析最后一行 JSON 输出
+        try:
+            json_str = output.strip().split('\n')[-1]
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            raise Exception(f"Invalid JSON output: {output}")
+
+    def save_result(self, image, profile, method, rep, data, error=None):
+        """保存结果到数据库"""
+        is_noise = False
+        status = 'SUCCESS'
+        
+        if error:
+            status = 'FAILED'
+        else:
+            # 数据质量控制
+            target_bw_mbps = float(CLIENT_PROFILES[profile]['bw'].replace('m', '')) 
+            measured_bw = data.get('bandwidth_measured', 0)
+            
+            # 1. 带宽偏差检查 (>50%)
+            if abs(measured_bw - target_bw_mbps) / target_bw_mbps > 0.5:
+                is_noise = True
+                status = 'ABNORMAL'
+            
+            # 2. 解压时间过短 (<10ms)
+            if data.get('decomp_time', 0) < 0.01:
+                is_noise = True
+                status = 'ABNORMAL'
+
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO experiments 
+            (image, client_profile, method, rep_id, status, download_time, decomp_time, 
+             total_time, cpu_usage, mem_usage, compressed_size, original_size, 
+             bandwidth_measured, is_noise, error_msg)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            image, profile, method, rep, status,
+            data.get('download_time', 0), data.get('decomp_time', 0),
+            data.get('total_time', 0), data.get('cpu_usage', 0),
+            data.get('mem_usage', 0), data.get('compressed_size', 0),
+            data.get('original_size', 0), data.get('bandwidth_measured', 0),
+            is_noise, str(error) if error else None
+        ))
+        self.conn.commit()
+        logger.info(f"实验结果已保存: {status}")
+
+    def run_matrix(self):
+        """执行完整实验矩阵"""
+        logger.info(f"开始运行实验矩阵: {len(TARGET_IMAGES)}镜像 x {len(CLIENT_PROFILES)}客户端 x {len(COMPRESSION_METHODS)}算法")
+        
+        # 1. 外层循环：镜像 (最耗时的资源，尽量少切换)
+        for image in TARGET_IMAGES:
             try:
-                container.stop()
-                container.remove()
-            except:
-                pass
-    
-    # 分析结果
-    print(f"\n=== 完整实验矩阵完成 ===")
-    success_count = len([r for r in all_results if r.get('status') == 'SUCCESS'])
-    print(f"成功执行: {success_count}/{len(all_results)} 次实验")
-    print(f"失败实验: {len([r for r in all_results if r.get('status') == 'ABNORMAL'])}/{len(all_results)} 次实验")
-    
-    # 检查解压性能数据是否收集到
-    decompression_data_count = 0
-    for result in all_results:
-        if result.get('decompression_performance'):
-            decompression_data_count += 1
-    
-    print(f"包含解压性能数据的实验: {decompression_data_count}/{len(all_results)} 次实验")
-    
-    # 保存结果到文件
-    output_file = f"{data_dir}/full_matrix_results.json"
-    with open(output_file, 'w') as f:
-        json.dump(all_results, f, indent=2)
-    
-    print(f"完整结果已保存到: {output_file}")
-    
-    # 生成摘要报告
-    generate_summary_report(all_results, output_file.replace('.json', '_summary.txt'))
-    
-    return all_results
-
-
-def generate_summary_report(results, output_path):
-    """
-    生成实验摘要报告
-    """
-    success_count = len([r for r in results if r.get('status') == 'SUCCESS'])
-    total_count = len(results)
-    
-    # 修复KeyError: 'image_name'问题 - 使用.get()方法安全获取字段
-    unique_images = len(set(r.get('image_name') for r in results if r.get('image_name')))
-    unique_algorithms = len(set(r.get('method') for r in results if r.get('method')))
-    
-    summary = f"""
-实验矩阵执行摘要报告
-===================
-
-执行统计:
-- 总实验数: {total_count}
-- 成功实验数: {success_count}
-- 失败实验数: {total_count - success_count}
-- 成功率: {success_count/total_count*100:.2f}%
-
-实验配置:
-- 客户端类型: C1-C6 (6种)
-- 测试镜像: {unique_images} 个
-- 压缩算法: {unique_algorithms} 种
-- 重复次数: 3 次
-
-时间统计:
-- 开始时间: {time.ctime()}
-- 结束时间: {time.ctime()}
-"""
-    
-    with open(output_path, 'w') as f:
-        f.write(summary)
-    
-    print(f"摘要报告已保存到: {output_path}")
-
+                # 2. 中层循环：客户端画像
+                for profile_name in CLIENT_PROFILES.keys():
+                    
+                    container = None
+                    try:
+                        # 启动特定环境的容器
+                        container = self.setup_client_container(profile_name)
+                        
+                        # 3. 内层循环：压缩算法
+                        for method in COMPRESSION_METHODS.keys():
+                            
+                            # 准备数据 payload (宿主机压缩)
+                            # 优化: 可以在Rep循环外做，但为了模拟每次请求，放在这里
+                            comp_path, orig_size, comp_size = self.prepare_image_payload(image, method)
+                            
+                            # 4. 重复实验
+                            for rep in range(REPETITIONS):
+                                if self.is_experiment_done(image, profile_name, method, rep):
+                                    logger.info(f"⏭️ 跳过已完成实验: {image} | {profile_name} | {method} | Rep{rep}")
+                                    continue
+                                
+                                logger.info(f"▶️ 执行实验: {image} | {profile_name} | {method} | Rep{rep}")
+                                self._clear_system_cache()
+                                
+                                try:
+                                    # 执行核心测试
+                                    result_data = self.run_agent_in_container(container, comp_path, method)
+                                    
+                                    # 补充宿主机已知的数据
+                                    result_data['original_size'] = orig_size
+                                    result_data['compressed_size'] = comp_size
+                                    
+                                    self.save_result(image, profile_name, method, rep, result_data)
+                                    
+                                except Exception as e:
+                                    logger.error(f"❌ 实验失败: {e}")
+                                    self.save_result(image, profile_name, method, rep, {}, error=e)
+                                
+                                time.sleep(1) # 冷却
+                            
+                            # 清理当次压缩文件
+                            if os.path.exists(comp_path):
+                                os.remove(comp_path)
+                                
+                    finally:
+                        if container:
+                            container.remove(force=True)
+                            
+                # 镜像层级清理: 完成一个镜像的所有实验后，删除本地镜像以释放空间
+                self.docker_client.images.remove(image, force=True)
+                logger.info(f"🧹 清理本地镜像: {image}")
+                
+            except Exception as e:
+                logger.critical(f"🔥 镜像层级严重错误 ({image}): {e}")
 
 if __name__ == "__main__":
-    # 首先检查环境支持
-    if not check_env_support():
-        print("⚠️  环境检查失败，切换到云模式运行")
-        # 可以选择继续运行或退出
-        response = input("是否继续以云模式运行？(y/n): ")
-        if response.lower() != 'y':
-            exit(1)
+    if os.geteuid() != 0:
+        logger.warning("建议以 root 权限运行，否则 Pumba 和 缓存清理 可能失效。")
     
-    run_full_experiment_matrix()
-
-
-def prepare_image_layers(image: str) -> Dict[str, str]:
-    """
-    为指定镜像准备所有压缩版本的层文件
-    
-    Args:
-        image: 镜像名称
-        
-    Returns:
-        字典，键为算法名称，值为临时文件路径
-    """
-    # 创建镜像专用的临时目录
-    image_temp_dir = Path(f"/tmp/experiment_data/{image.replace(':', '_')}")
-    image_temp_dir.mkdir(parents=True, exist_ok=True)
-    
-    layer_files = {}
-    algorithms = [
-        'gzip-1', 'gzip-6', 'gzip-9',
-        'zstd-1', 'zstd-3', 'zstd-6',
-        'lz4-fast', 'lz4-medium', 'lz4-slow',
-        'brotli-1'
-    ]
-    
-    for algorithm in algorithms:
-        # 模拟生成或下载对应压缩级别的文件
-        # 实际应用中应从仓库拉取或调用压缩服务生成
-        compressed_file = image_temp_dir / f"{algorithm}_layer.tar"
-        # 创建空文件作为占位符（实际应写入真实数据）
-        compressed_file.touch()
-        layer_files[algorithm] = str(compressed_file)
-    
-    return layer_files
-
-def cleanup_image_layers(image: str):
-    """
-    清理指定镜像的所有临时文件
-    
-    Args:
-        image: 镜像名称
-    """
-    image_temp_dir = Path(f"/tmp/experiment_data/{image.replace(':', '_')}")
-    if image_temp_dir.exists():
-        shutil.rmtree(image_temp_dir)
-    
-    # 确保父目录存在
-    parent_dir = image_temp_dir.parent
-    parent_dir.mkdir(exist_ok=True)
-
-# 添加缺失的全局变量
-client_types = ["C1", "C2", "C3", "C4", "C5", "C6"]
-images = [
-    "centos", "fedora", "ubuntu",
-    "mongo", "mysql", "postgres",
-    "redis", "nginx", "tomcat",
-    "wordpress", "drupal", "joomla",
-    "magento", "prestashop", "shopify",
-    "laravel", "django", "flask",
-    "rails", "spring", "nodejs"
-]
-algorithms = [
-    'gzip-1', 'gzip-6', 'gzip-9',
-    'zstd-1', 'zstd-3', 'zstd-6',
-    'lz4-fast', 'lz4-medium', 'lz4-slow',
-    'brotli-1'
-]
+    orchestrator = ExperimentOrchestrator()
+    orchestrator.run_matrix()
