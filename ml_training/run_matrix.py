@@ -145,19 +145,18 @@ class ExperimentOrchestrator:
 
 
     def setup_client_container(self, profile_name):
-        """启动特定配置的客户端容器"""
+        """启动并配置客户端容器，应用网络限制"""
         config = CLIENT_PROFILES[profile_name]
         container_name = f"cts_worker_{profile_name}"
         
-        # 清理旧容器
+        # 1. 清理旧容器
         try:
             old = self.docker_client.containers.get(container_name)
             old.remove(force=True)
         except docker.errors.NotFound:
             pass
 
-        # 启动新容器 (应用 CPU/Mem 限制)
-        # 启动新容器 (应用 CPU/Mem 限制 + 网络权限)
+        # 2. 启动新容器 (关键：必须给 NET_ADMIN 权限)
         container = self.docker_client.containers.run(
             CLIENT_IMAGE,
             name=container_name,
@@ -165,25 +164,26 @@ class ExperimentOrchestrator:
             tty=True,
             nano_cpus=int(config['cpu'] * 1e9),
             mem_limit=config['mem'],
-            # === 【新增下面这一行】 ===
-            cap_add=['NET_ADMIN'], 
-            # =========================
+            cap_add=['NET_ADMIN'], # <--- 必须有这个，否则 tc 无法运行
             volumes={TEMP_DIR: {'bind': '/data', 'mode': 'rw'}}, 
             command="tail -f /dev/null"
         )
         
-        # 应用网络仿真 (Pumba)
-        # 注意: 需要在宿主机安装 pumba 二进制文件
+        # 3. 【核心修改】直接在容器内执行 TC，瞬间生效！
+        # 不要再用 subprocess 调用 pumba 了！
         logger.info(f"应用网络限制 ({profile_name}): BW={config['bw']}, Delay={config['delay']}")
-        pumba_cmd = [
-            "pumba", "netem",
-            "--interface", "eth0",
-            "--duration", "5m", 
-            "rate", "--rate", config['bw'],
-            "delay", "--time", config['delay'], "--jitter", "5ms", "--correlation", "0",
-            container_name
-        ]
-        subprocess.run(pumba_cmd, check=True)
+        
+        # 构造 tc 命令
+        tc_cmd = f"tc qdisc add dev eth0 root netem rate {config['bw']} delay {config['delay']}"
+        
+        # 执行命令 (几毫秒就完成)
+        exit_code, output = container.exec_run(tc_cmd)
+        
+        if exit_code != 0:
+            logger.warning(f"TC设置警告 (尝试重置): {output.decode()}")
+            # 如果规则冲突，先删后加
+            container.exec_run("tc qdisc del dev eth0 root")
+            container.exec_run(tc_cmd)
         
         return container
 
