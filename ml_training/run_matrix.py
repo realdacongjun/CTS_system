@@ -206,7 +206,7 @@ class ExperimentOrchestrator:
         # === 核心修改结束 ===
 
         # 构造容器内命令
-        cmd = f"python3 /app/client_agent.py --file {container_path} --method {base_method}"
+        cmd = f"python3 /app/client_agent.py {container_path} --method {base_method}"
         
         # 执行命令
         exec_result = container.exec_run(cmd)
