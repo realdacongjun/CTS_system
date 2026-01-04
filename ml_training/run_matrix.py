@@ -187,22 +187,35 @@ class ExperimentOrchestrator:
         
         return container
 
+
+
     def run_agent_in_container(self, container, compressed_file, method_name):
         """在容器内执行解压测试"""
         filename = os.path.basename(compressed_file)
         container_path = f"/data/{filename}"
         
+        # === 核心修改开始：参数清洗 ===
+        # 目的：把 'gzip-1' 变成 'gzip'，把 'lz4-slow' 变成 'lz4'
+        if 'lz4' in method_name:
+            base_method = 'lz4'
+        elif 'brotli' in method_name:
+            base_method = 'brotli'
+        else:
+            # 针对 gzip-1, zstd-3 这种格式，取横杠前的部分
+            base_method = method_name.split('-')[0]
+        # === 核心修改结束 ===
+
         # 构造容器内命令
-        # 假设 client_agent.py 接受: python3 client_agent.py --file <path> --method <method>
-        cmd = f"python3 /app/client_agent.py --file {container_path} --method {method_name}"
+        cmd = f"python3 /app/client_agent.py --file {container_path} --method {base_method}"
         
+        # 执行命令
         exec_result = container.exec_run(cmd)
         output = exec_result.output.decode('utf-8')
         
         if exec_result.exit_code != 0:
+            logger.error(f"Agent Error Output: {output}")
             raise Exception(f"Agent Execution Failed: {output}")
             
-        # 解析最后一行 JSON 输出
         try:
             json_str = output.strip().split('\n')[-1]
             return json.loads(json_str)

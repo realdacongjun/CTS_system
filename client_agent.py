@@ -5,18 +5,6 @@ CTS Experiment Client Agent
 This script runs inside a controlled container environment. It is responsible for
 the core task of an experiment run: decompressing a given image layer
 with a specific algorithm and measuring its performance.
-
-It is invoked by the experiment orchestrator with specific parameters.
-
-Workflow:
-1. Parses command-line arguments: path to the compressed layer and the algorithm to use.
-2. Reads the entire compressed file into memory to simulate network download.
-3. Records baseline resource usage (CPU, memory).
-4. Decompresses the data, measuring the wall-clock time with high precision.
-5. Records final resource usage.
-6. Calculates performance metrics (e.g., decompression time, CPU usage delta).
-7. Prints a single line of JSON to standard output with the results. This is
-   the communication channel back to the orchestrator.
 """
 import argparse
 import gzip
@@ -35,6 +23,10 @@ try:
     import lz4.frame as lz4
 except ImportError:
     lz4 = None
+try:
+    import brotli
+except ImportError:
+    brotli = None
 
 # --- Performance Measurement ---
 
@@ -50,20 +42,10 @@ def get_process_resources():
 def decompress_data(data: bytes, method: str) -> (bytes, float):
     """
     Decompresses data using the specified method and measures the time taken.
-
-    Args:
-        data: The compressed byte string.
-        method: The decompression algorithm ('gzip', 'zstd', 'lz4').
-
-    Returns:
-        A tuple of (decompressed_data, time_taken_seconds).
-        Returns (None, -1.0) on failure.
     """
     decompressed = None
     
     # --- Decompression Logic ---
-    # The core of the performance measurement.
-    # We use time.perf_counter() for high-precision wall-clock time.
     start_time = time.perf_counter()
     try:
         if method == 'gzip':
@@ -71,13 +53,18 @@ def decompress_data(data: bytes, method: str) -> (bytes, float):
         elif method == 'zstd':
             if not zstd:
                 raise RuntimeError("zstandard library not installed")
-            # zstd.decompress() is highly optimized
             decompressed = zstd.decompress(data)
         elif method == 'lz4':
             if not lz4:
                 raise RuntimeError("lz4 library not installed")
-            # lz4.decompress() is also highly optimized
             decompressed = lz4.decompress(data)
+        elif method == 'brotli':
+            if not brotli:
+                raise RuntimeError("brotli library not installed")
+            decompressed = brotli.decompress(data)
+        elif method == 'uncompressed':
+            # For baseline comparison, we just copy the data
+            decompressed = data
         else:
             raise ValueError(f"Unsupported decompression method: {method}")
     except Exception:
@@ -107,7 +94,8 @@ def main():
         "--method",
         type=str,
         required=True,
-        choices=['gzip', 'zstd', 'lz4', 'uncompressed'],
+        # === 关键修改：加入了 'brotli' ===
+        choices=['gzip', 'zstd', 'lz4', 'brotli', 'uncompressed'],
         help="The decompression algorithm to use."
     )
 
@@ -139,12 +127,10 @@ def main():
         sys.exit(1)
 
     # --- 2. Decompress and Measure ---
-    # Record resources before the heavy work
     res_before = get_process_resources()
     
     decompressed_data, time_taken = decompress_data(compressed_data, args.method)
 
-    # Record resources after the heavy work
     res_after = get_process_resources()
     result["decompression_time"] = time_taken
 
@@ -155,15 +141,11 @@ def main():
         result["uncompressed_size_bytes"] = len(decompressed_data)
 
     # --- 3. Calculate Resource Usage Deltas ---
-    # CPU time is more reliable than trying to measure % CPU usage over a short period.
     cpu_delta = res_after["cpu_times"].user - res_before["cpu_times"].user
     result["cpu_user_time_delta"] = cpu_delta if cpu_delta > 0 else 0.0
-
-    # For memory, we just record the peak resident set size (RSS).
     result["memory_rss_bytes_peak"] = res_after["memory_rss_bytes"]
 
     # --- 4. Output JSON Result ---
-    # This single line is parsed by the orchestrator.
     print(json.dumps(result))
 
 
@@ -173,5 +155,7 @@ if __name__ == "__main__":
         sys.stderr.write("Warning: 'zstandard' library not found. 'zstd' method will fail.\n")
     if lz4 is None:
         sys.stderr.write("Warning: 'lz4' library not found. 'lz4' method will fail.\n")
+    if brotli is None:
+        sys.stderr.write("Warning: 'brotli' library not found. 'brotli' method will fail.\n")
     
     main()
