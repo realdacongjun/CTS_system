@@ -1,15 +1,16 @@
 # 基础镜像
 FROM python:3.9-slim
 
-# 1. 换源并安装系统依赖 (增加 brotli 命令行工具以便调试，liblz4-dev 等用于编译)
-RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list && \
+# 1. 换源（适配 Debian 12 Bookworm）并安装系统依赖
+# 注意这里修改了文件路径：/etc/apt/sources.list.d/debian.sources
+RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources && \
     apt-get update && apt-get install -y \
     liblz4-dev \
     zlib1g-dev \
     brotli \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. 安装Python依赖 (增加清华源加速，增加 brotli 库)
+# 2. 安装Python依赖 (保持不变)
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
     zstandard==0.19.0 \
     lz4==4.0.0 \
@@ -23,6 +24,5 @@ WORKDIR /app
 # 复制脚本
 COPY client_agent.py .
 
-# 3. 【关键修改】让容器默认处于"挂机"状态
-# 这样 orchestrator 才能启动它并通过 exec_run 注入命令
+# 3. 容器默认挂机
 CMD ["tail", "-f", "/dev/null"]
