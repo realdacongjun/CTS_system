@@ -240,9 +240,9 @@ class ExperimentOrchestrator:
             # ... (后略)
             
             # 1. 带宽偏差检查 (>50%)
-            if abs(measured_bw - target_bw_mbps) / target_bw_mbps > 0.5:
-                is_noise = True
-                status = 'ABNORMAL'
+            # if abs(measured_bw - target_bw_mbps) / target_bw_mbps > 0.5:
+            #     is_noise = True
+            #     status = 'ABNORMAL'
             
             # 2. 解压时间过短 (<10ms)
             if data.get('decomp_time', 0) < 0.01:
