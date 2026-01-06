@@ -5,7 +5,7 @@
 
 # === 修改后 (正确写法) ===
 CLIENT_PROFILES = {
-    'C1': {'cpu': 0.2, 'mem': '512m', 'bw': '2mbit',   'delay': '100ms', 'desc': '极低性能'},
+    'C1': {'cpu': 0.2, 'mem': '1g', 'bw': '2mbit',   'delay': '100ms', 'desc': '极低性能'},
     'C2': {'cpu': 0.5, 'mem': '1g',   'bw': '20mbit',  'delay': '50ms',  'desc': '低性能'},
     'C3': {'cpu': 1.0, 'mem': '2g',   'bw': '5mbit',   'delay': '20ms',  'desc': '中等性能'},
     'C4': {'cpu': 1.5, 'mem': '2g',   'bw': '50mbit',  'delay': '10ms',  'desc': '中高性能'},
