@@ -1,95 +1,101 @@
+import time
 import argparse
-import gzip
 import json
 import os
+import subprocess
+import shutil
 import sys
-import time
-import psutil
+# 使用标准库 urllib，避免容器里没装 requests 的尴尬
+import urllib.request 
 
-# Conditional imports for compression libraries
-try:
-    import zstandard as zstd
-except ImportError:
-    zstd = None
-try:
-    import lz4.frame as lz4
-except ImportError:
-    lz4 = None
-try:
-    import brotli
-except ImportError:
-    brotli = None
+def run_command(cmd):
+    """运行 shell 命令并返回耗时"""
+    start = time.time()
+    subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL)
+    return time.time() - start
 
-def get_process_resources():
-    process = psutil.Process(os.getpid())
-    mem_info = process.memory_info()
-    return {
-        "cpu_times": process.cpu_times(),
-        "memory_rss_bytes": mem_info.rss,
-    }
-
-def decompress_data(data: bytes, method: str):
-    start_time = time.perf_counter()
+def download_file(url, save_path):
+    """从 Server 下载文件，返回下载耗时"""
+    start = time.time()
+    # 缓冲区大小设置为 1MB，模拟真实的大文件传输
+    chunk_size = 1024 * 1024 
+    
     try:
-        if method == 'gzip':
-            decompressed = gzip.decompress(data)
-        elif method == 'zstd':
-            if not zstd: raise RuntimeError("zstandard library not installed")
-            decompressed = zstd.decompress(data)
-        elif method == 'lz4':
-            if not lz4: raise RuntimeError("lz4 library not installed")
-            decompressed = lz4.decompress(data)
-        elif method == 'brotli':
-            if not brotli: raise RuntimeError("brotli library not installed")
-            decompressed = brotli.decompress(data)
-        elif method == 'uncompressed':
-            decompressed = data
-        else:
-            raise ValueError(f"Unsupported decompression method: {method}")
+        with urllib.request.urlopen(url) as response:
+            with open(save_path, 'wb') as f:
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk: break
+                    f.write(chunk)
     except Exception as e:
-        return None, 0
+        # 如果下载失败，抛出异常给主程序捕获
+        raise RuntimeError(f"Download failed: {str(e)}")
         
-    end_time = time.perf_counter()
-    return decompressed, end_time - start_time
+    return time.time() - start
 
 def main():
     parser = argparse.ArgumentParser()
-    # 适配 run_matrix.py 的调用方式 (它是直接传文件名，没有 --file 前缀)
-    parser.add_argument("image_layer_path", type=str)
-    parser.add_argument("--method", type=str, required=True)
+    # 这里接收的是 URL 而不是本地路径了
+    parser.add_argument("url", help="Target file URL (e.g., http://server:8000/file.tar.gz)")
+    parser.add_argument("--method", required=True, help="Compression method")
     args = parser.parse_args()
 
-    # 读取文件
-    try:
-        with open(args.image_layer_path, 'rb') as f:
-            compressed_data = f.read()
-    except Exception as e:
-        # 如果读取失败，返回空JSON让脚本报错
-        print(json.dumps({"error": str(e)}))
-        sys.exit(1)
-
-    # 测量
-    res_before = get_process_resources()
-    decompressed_data, time_taken = decompress_data(compressed_data, args.method)
-    res_after = get_process_resources()
-
-    # 计算 CPU (简单计算 user time 增量)
-    cpu_delta = res_after["cpu_times"].user - res_before["cpu_times"].user
+    # 1. 准备路径
+    filename = args.url.split('/')[-1]
+    local_compressed_path = f"/tmp/{filename}"
+    output_dir = "/tmp/output_data"
     
-    # === 关键修改：统一输出格式 ===
-    # 必须把 Key 改成 run_matrix.py 里的名字
+    if os.path.exists(output_dir): shutil.rmtree(output_dir)
+    os.makedirs(output_dir)
+
     result = {
-        "status": "SUCCESS" if decompressed_data else "FAILED",
-        "decomp_time": time_taken,              # 改名: decompression_time -> decomp_time
-        "download_time": 0.0,                   # 补充字段
-        "total_time": time_taken,               # 补充字段
-        "cpu_usage": cpu_delta,                 # 改名: cpu_user_time_delta -> cpu_usage
-        "mem_usage": res_after["memory_rss_bytes"], # 改名
-        "compressed_size": len(compressed_data),    # 改名
-        "original_size": len(decompressed_data) if decompressed_data else 0,
-        "bandwidth_measured": 0.0
+        "status": "FAILED",
+        "download_time": 0,
+        "decomp_time": 0,
+        "total_time": 0,
+        "cpu_usage": 0, # 这里先简化，回头可以用 psutil 加回来
+        "mem_usage": 0
     }
 
+    try:
+        # === 阶段 1: 真实网络下载 (传输层) ===
+        # print(f"⬇️ Downloading from {args.url}...")
+        dl_time = download_file(args.url, local_compressed_path)
+        result["download_time"] = dl_time
+
+        # === 阶段 2: 解压 (计算层) ===
+        # print(f"📦 Decompressing {args.method}...")
+        cmd = ""
+        if args.method == 'gzip':
+            cmd = f"tar -xzf {local_compressed_path} -C {output_dir}"
+        elif args.method == 'brotli':
+            # brotli 需要先解压成 tar 再解包，或者管道
+            cmd = f"brotli -d {local_compressed_path} -o /tmp/temp.tar && tar -xf /tmp/temp.tar -C {output_dir}"
+        elif args.method == 'zstd':
+            cmd = f"tar -I zstd -xf {local_compressed_path} -C {output_dir}"
+        elif 'lz4' in args.method:
+            cmd = f"lz4 -d {local_compressed_path} -c | tar -xf - -C {output_dir}"
+        else:
+            # 默认尝试直接 tar
+            cmd = f"tar -xf {local_compressed_path} -C {output_dir}"
+
+        decomp_time = run_command(cmd)
+        result["decomp_time"] = decomp_time
+        result["total_time"] = dl_time + decomp_time
+        result["status"] = "SUCCESS"
+
+    except Exception as e:
+        result["error"] = str(e)
+        # print(f"Error: {e}", file=sys.stderr)
+    
+    finally:
+        # 清理垃圾，防止容器炸硬盘
+        if os.path.exists(local_compressed_path): os.remove(local_compressed_path)
+        if os.path.exists(output_dir): shutil.rmtree(output_dir)
+        # 这里的 /tmp/temp.tar 是 brotli 可能产生的中间文件
+        if os.path.exists("/tmp/temp.tar"): os.remove("/tmp/temp.tar")
+
+    # 输出 JSON 供宿主机捕获
     print(json.dumps(result))
 
 if __name__ == "__main__":
