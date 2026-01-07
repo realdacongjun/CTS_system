@@ -28,20 +28,17 @@ class ExperimentOrchestrator:
         self._init_db()
         self._check_dependencies()
         
-        # 确保临时目录存在
         if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
         os.makedirs(TEMP_DIR)
 
-        # === 新增：网络架构初始化 ===
         self.network_name = "cts_experiment_net"
         self.server_container_name = "cts_image_server"
-        self.server_ip = "cts_image_server" # Docker DNS 会自动解析容器名
+        self.server_ip = "cts_image_server"
         self.server_port = 8000
         
         self._setup_infrastructure()
 
     def _init_db(self):
-        # 数据库结构保持不变
         cursor = self.conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS experiments (
@@ -68,7 +65,6 @@ class ExperimentOrchestrator:
         self.conn.commit()
 
     def _check_dependencies(self):
-        # 只需要检查 lz4，tc 现在在容器里跑，宿主机不需要装
         try:
             subprocess.run(['lz4', '--version'], check=True, stdout=subprocess.PIPE)
             logger.info("✅ 环境依赖检查通过")
@@ -77,42 +73,30 @@ class ExperimentOrchestrator:
             sys.exit(1)
 
     def _setup_infrastructure(self):
-        """搭建实验基础设施：网络 + 服务端容器"""
         logger.info("🏗️  正在搭建实验网络架构...")
-        
-        # 1. 创建专用网络
         try:
             self.docker_client.networks.get(self.network_name).remove()
         except: pass
         self.network = self.docker_client.networks.create(self.network_name, driver="bridge")
 
-        # 2. 启动服务端容器 (长期运行)
         try:
             self.docker_client.containers.get(self.server_container_name).remove(force=True)
         except: pass
         
         logger.info("🔵 启动镜像服务器 (Image Server)...")
-        # 我们直接用 cts_client_image 充当服务器，因为它里面有 python
         self.server = self.docker_client.containers.run(
             CLIENT_IMAGE,
             name=self.server_container_name,
             network=self.network_name,
             detach=True,
-            cap_add=["NET_ADMIN"], # 必须有这个权限才能运行 tc
-            volumes={TEMP_DIR: {'bind': '/data', 'mode': 'ro'}}, # 只读挂载数据
-            # 启动 HTTP Server，根目录为 /data
+            cap_add=["NET_ADMIN"],
+            volumes={TEMP_DIR: {'bind': '/data', 'mode': 'ro'}},
             command=f"python3 -m http.server {self.server_port} --directory /data"
         )
-        # 确保服务器起来了
         time.sleep(2) 
 
     def update_server_network(self, bw, delay):
-        """动态调整服务端的上传限制"""
-        # 先删除旧规则 (容错)
         self.server.exec_run("tc qdisc del dev eth0 root")
-        
-        # 添加新规则 (Netem 同时控制带宽和延迟)
-        # 这里的 rate 是限制服务器的【上传速度】，也就是客户端的【下载速度】
         cmd = f"tc qdisc add dev eth0 root netem rate {bw} delay {delay}"
         exit_code, output = self.server.exec_run(cmd)
         
@@ -130,11 +114,9 @@ class ExperimentOrchestrator:
         return cursor.fetchone()[0] > 0
 
     def _pull_and_save_raw_tar(self, image_name):
-        # 这一步和原来一样，宿主机负责准备原始数据
         safe_img_name = image_name.replace(':', '_').replace('/', '_')
         raw_tar_path = os.path.join(TEMP_DIR, f"{safe_img_name}_raw.tar")
         
-        # 如果文件已存在且大小正常，跳过拉取（断点续传优化）
         if os.path.exists(raw_tar_path) and os.path.getsize(raw_tar_path) > 1000:
              return raw_tar_path, os.path.getsize(raw_tar_path)
 
@@ -153,8 +135,6 @@ class ExperimentOrchestrator:
             raise e
 
     def _create_compressed_payload(self, raw_tar_path, method_name):
-        # 压缩逻辑和原来一样，生成的文件会在 TEMP_DIR 里
-        # 因为 Server 挂载了 TEMP_DIR，所以 Client 马上就能通过 HTTP 下载到它
         cmd_args = COMPRESSION_METHODS[method_name]
         if 'gzip' in method_name: ext = '.gz'
         elif 'zstd' in method_name: ext = '.zst'
@@ -163,15 +143,10 @@ class ExperimentOrchestrator:
         else: ext = '.dat'
         
         compressed_path = raw_tar_path + ext
-        # 简单缓存检查
         if os.path.exists(compressed_path):
              return compressed_path, os.path.getsize(compressed_path)
 
         try:
-            # ... (压缩代码保持不变，照抄你之前的逻辑) ...
-            # 为了节省篇幅，这里假设你保留了之前的 subprocess 压缩逻辑
-            # 务必把之前的 _create_compressed_payload 完整逻辑放在这里
-            # 注意：lz4 需要 input output 格式
             if 'lz4' in method_name:
                 subprocess.run(cmd_args + [raw_tar_path, compressed_path], check=True)
             elif 'zstd' in method_name:
@@ -186,34 +161,33 @@ class ExperimentOrchestrator:
             raise e
 
     def run_agent_in_container(self, profile_name, compressed_file, method_name):
-        """启动 Client 容器 -> 下载 -> 解压"""
         config = CLIENT_PROFILES[profile_name]
         filename = os.path.basename(compressed_file)
-        
-        # 构造下载链接：http://cts_image_server:8000/文件名
         target_url = f"http://{self.server_ip}:{self.server_port}/{filename}"
-        
+        container_name = f"cts_worker_{profile_name}"
+
+        # 【修复点 1】: 预先清理可能残留的同名容器，防止Conflict
+        try:
+            self.docker_client.containers.get(container_name).remove(force=True)
+        except: pass
+
         container = None
         try:
-            # 启动 Client 容器
+            # 【修复点 2】: 路径改为当前目录 os.path.abspath("client_agent.py")
             container = self.docker_client.containers.run(
                 CLIENT_IMAGE,
-                name=f"cts_worker_{profile_name}",
-                network=self.network_name, # 加入同一网络
+                name=container_name,
+                network=self.network_name,
                 detach=True,
                 nano_cpus=int(config['cpu'] * 1e9),
                 mem_limit=config['mem'],
-                # ⚠️ 关键点：挂载最新的 client_agent.py 脚本进去
                 volumes={
-                    os.path.abspath("ml_training/client_agent.py"): {'bind': '/app/client_agent.py', 'mode': 'ro'}
+                    os.path.abspath("client_agent.py"): {'bind': '/app/client_agent.py', 'mode': 'ro'}
                 },
                 command="tail -f /dev/null"
             )
             
-            # 运行脚本
-            # 注意：这里不需要传本地路径了，传 URL
             cmd = f"python3 /app/client_agent.py {target_url} --method {method_name}"
-            
             exec_result = container.exec_run(cmd)
             output = exec_result.output.decode('utf-8', errors='ignore')
             
@@ -223,14 +197,14 @@ class ExperimentOrchestrator:
             return json.loads(output.strip().split('\n')[-1])
 
         finally:
-            if container: container.remove(force=True)
+            if container: 
+                try: container.remove(force=True)
+                except: pass
 
     def save_result(self, image, profile, method, rep, data, error=None):
-        # 保持不变
         status = 'FAILED' if error else 'SUCCESS'
         is_noise = False
-        # ... (照抄之前的 save_result) ...
-        # 这里为了确保代码完整性，请保留原有的 database insert 逻辑
+        
         cursor = self.conn.cursor()
         cursor.execute('''
             INSERT OR REPLACE INTO experiments 
@@ -253,7 +227,6 @@ class ExperimentOrchestrator:
             logger.warning(f"❌ 失败: {method} | {error}")
 
     def cleanup(self):
-        """清理所有资源"""
         try: self.server.remove(force=True)
         except: pass
         try: self.network.remove()
@@ -262,20 +235,17 @@ class ExperimentOrchestrator:
 
     def run_matrix(self):
         logger.info(f"🚀 开始全真网络仿真实验...")
-        
         try:
             for image in TARGET_IMAGES:
                 try:
                     raw_path, raw_size = self._pull_and_save_raw_tar(image)
                     
                     for profile_name in CLIENT_PROFILES.keys():
-                        # 1. 在 Server 端应用当前 Profile 的网络限制
                         config = CLIENT_PROFILES[profile_name]
                         self.update_server_network(config['bw'], config['delay'])
                         
                         for method in COMPRESSION_METHODS.keys():
                             try:
-                                # 检查是否已完成
                                 needed_reps = []
                                 for r in range(REPETITIONS):
                                     if not self.is_experiment_done(image, profile_name, method, r):
@@ -283,38 +253,28 @@ class ExperimentOrchestrator:
                                 
                                 if not needed_reps: continue
 
-                                # 2. 准备压缩包
                                 comp_path, comp_size = self._create_compressed_payload(raw_path, method)
                                 
-                                # 3. 跑实验
                                 for rep in needed_reps:
                                     logger.info(f"▶️  {image} | {profile_name} | {method} | Rep{rep}")
                                     try:
-                                        # 这一步会自动启动 Client 去下载
                                         result = self.run_agent_in_container(profile_name, comp_path, method)
                                         result.update({'original_size': raw_size, 'compressed_size': comp_size})
                                         self.save_result(image, profile_name, method, rep, result)
                                     except Exception as e:
                                         self.save_result(image, profile_name, method, rep, {}, error=e)
                                     
-                                    # 稍微歇一下，防止 Docker 网络堵死
                                     time.sleep(1)
-
                             finally:
-                                # 只有当所有 Profile 都跑完这个 method，才删文件？
-                                # 现在的逻辑是跑完一个 method 就删，这样其实也没事，反正生成很快
                                 if comp_path and os.path.exists(comp_path):
                                     os.remove(comp_path)
-
                 except Exception as e:
                     logger.critical(f"🔥 镜像级错误 ({image}): {e}")
                 finally:
-                    # 清理原始 tar
                     if 'raw_path' in locals() and os.path.exists(raw_path):
                         os.remove(raw_path)
                     try: self.docker_client.images.remove(image, force=True)
-                    except: pass
-                    
+                    except: pass  
         finally:
             self.cleanup()
 
