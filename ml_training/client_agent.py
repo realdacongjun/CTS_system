@@ -69,8 +69,9 @@ def main():
         decomp_time = run_command(cmd)
         
         # 【兜底策略】如果 perf_counter 依然测出 0 (极罕见)，强制给一个极小值
-        if decomp_time == 0:
+        if decomp_time < 0.000001:
             decomp_time = 0.000001 # 1微秒
+            
             
         result["decomp_time"] = decomp_time
         result["total_time"] = dl_time + decomp_time
