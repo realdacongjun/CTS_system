@@ -71,10 +71,8 @@ class ExperimentOrchestrator:
         for tool in required_tools:
             if not shutil.which(tool):
                 missing.append(tool)
-        
         if missing:
             logger.error(f"❌ 宿主机缺少必要工具: {', '.join(missing)}")
-            logger.error("请安装: yum install -y tar gzip zstd lz4 brotli")
             sys.exit(1)
         logger.info("✅ 环境依赖检查通过")
 
@@ -102,25 +100,15 @@ class ExperimentOrchestrator:
         time.sleep(2) 
 
     def update_server_network(self, bw, delay):
-        # 【修复点】删除了 check=False，因为 exec_run 不支持该参数
-        # 1. 清理旧规则 (忽略返回值即可)
-        self.server.exec_run("tc qdisc del dev eth0 root")
-        
-        # 2. TBF 限速
+        self.server.exec_run("tc qdisc del dev eth0 root", check=False)
         cmd_tbf = f"tc qdisc add dev eth0 root handle 1: tbf rate {bw} burst 32kbit latency 400ms"
         exit_code, output = self.server.exec_run(cmd_tbf)
         if exit_code != 0:
             logger.error(f"❌ TBF限速失败: {output.decode()}")
             return
-
-        # 3. Netem 延迟
         cmd_netem = f"tc qdisc add dev eth0 parent 1:1 handle 10: netem delay {delay}"
-        exit_code, output = self.server.exec_run(cmd_netem)
-        
-        if exit_code != 0:
-            logger.error(f"❌ Netem延迟失败: {output.decode()}")
-        else:
-            logger.info(f"🌐 网络更新: {bw} + {delay}")
+        self.server.exec_run(cmd_netem)
+        logger.info(f"🌐 网络更新: {bw} + {delay}")
 
     def is_experiment_done(self, image, profile, method, rep):
         cursor = self.conn.cursor()
@@ -133,20 +121,16 @@ class ExperimentOrchestrator:
     def _pull_and_save_raw_tar(self, image_name):
         safe_img_name = image_name.replace(':', '_').replace('/', '_')
         raw_tar_path = os.path.join(TEMP_DIR, f"{safe_img_name}_raw.tar")
-        
         if os.path.exists(raw_tar_path) and os.path.getsize(raw_tar_path) > 1000:
              return raw_tar_path, os.path.getsize(raw_tar_path)
-
         try:
             logger.info(f"⬇️  正在拉取镜像: {image_name}")
             self.docker_client.images.pull(image_name)
-            
             logger.info(f"💾 正在导出: {safe_img_name}")
             image = self.docker_client.images.get(image_name)
             with open(raw_tar_path, 'wb') as f:
                 for chunk in image.save():
                     f.write(chunk)
-            
             return raw_tar_path, os.path.getsize(raw_tar_path)
         except Exception as e:
             if os.path.exists(raw_tar_path): os.remove(raw_tar_path)
@@ -164,17 +148,23 @@ class ExperimentOrchestrator:
         else: ext = '.tar'
         
         compressed_path = raw_tar_path + ext
-        
         if os.path.exists(compressed_path):
              return compressed_path, os.path.getsize(compressed_path)
 
         try:
-            tar_cmd = ['tar', '-I', f"{prog} {args}", '-cf', compressed_path, raw_tar_path]
-            subprocess.run(tar_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            # 【核心修复】改为管道操作，100% 避免参数解析错误！
+            # 命令示例: tar -cf - raw.tar | lz4 -3 --force > compressed.tar.lz4
+            pipe_cmd = f"tar -cf - {raw_tar_path} | {prog} {args} > {compressed_path}"
+            
+            subprocess.run(pipe_cmd, shell=True, check=True, executable='/bin/bash')
+            
+            # 【双重保险】检查文件是否为 0 字节
+            if not os.path.exists(compressed_path) or os.path.getsize(compressed_path) < 100:
+                raise Exception("Compressed file is empty or too small (Compression Failed)!")
+                
             return compressed_path, os.path.getsize(compressed_path)
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr.decode() if e.stderr else "Unknown error"
-            logger.error(f"Compression failed for {method_name}: {error_msg}")
+        except Exception as e:
+            logger.error(f"Compression failed for {method_name}: {e}")
             if os.path.exists(compressed_path): os.remove(compressed_path)
             raise e
 
@@ -182,9 +172,13 @@ class ExperimentOrchestrator:
         config = CLIENT_PROFILES[profile_name]
         filename = os.path.basename(compressed_file)
         target_url = f"http://{self.server_ip}:{self.server_port}/{filename}"
-        
         random_suffix = uuid.uuid4().hex[:6]
         container_name = f"cts_worker_{profile_name}_{random_suffix}"
+        
+        # 强制绝对路径
+        agent_host_path = "/root/CTS_system/ml_training/client_agent.py"
+        if not os.path.exists(agent_host_path):
+            raise Exception(f"Client agent not found at {agent_host_path}")
 
         container = None
         try:
@@ -196,24 +190,23 @@ class ExperimentOrchestrator:
                 nano_cpus=int(config['cpu'] * 1e9),
                 mem_limit=config['mem'],
                 volumes={
-                    os.path.abspath("client_agent.py"): {'bind': '/app/client_agent.py', 'mode': 'ro'}
+                    agent_host_path: {'bind': '/app/client_agent.py', 'mode': 'ro'}
                 },
                 command="tail -f /dev/null"
             )
             
-            cmd = f"timeout 300 python3 /app/client_agent.py {target_url} --method {method_name}"
+            # 【核心修复】超时延长至 1200秒 (20分钟)
+            cmd = f"timeout 1200 python3 /app/client_agent.py {target_url} --method {method_name}"
             exec_res = container.exec_run(f"sh -c '{cmd}'")
             
             if exec_res.exit_code != 0:
                 err_log = exec_res.output.decode('utf-8', errors='ignore')
-                raise Exception(f"Agent Execution Failed: {err_log[-200:]}")
+                raise Exception(f"Agent Failed (Exit {exec_res.exit_code}): {err_log[-200:]}")
 
             cat_res = container.exec_run("cat /tmp/result.json")
             if cat_res.exit_code != 0:
                  raise Exception("Result file not found")
-                 
             return json.loads(cat_res.output.decode('utf-8').strip())
-
         finally:
             if container: 
                 try: container.remove(force=True)
@@ -221,8 +214,6 @@ class ExperimentOrchestrator:
 
     def save_result(self, image, profile, method, rep, data, error=None):
         status = 'FAILED' if error else 'SUCCESS'
-        is_noise = False
-        
         cursor = self.conn.cursor()
         cursor.execute('''
             INSERT OR REPLACE INTO experiments 
@@ -236,46 +227,35 @@ class ExperimentOrchestrator:
             data.get('total_time', 0), data.get('cpu_usage', 0),
             data.get('mem_usage', 0), data.get('compressed_size', 0),
             data.get('original_size', 0), data.get('bandwidth_measured', 0),
-            is_noise, str(error) if error else None
+            False, str(error) if error else None
         ))
         self.conn.commit()
         if status == 'SUCCESS':
-            logger.info(f"✅ 完成: {profile} | {method} | DL={data.get('download_time',0):.2f}s | Decomp={data.get('decomp_time',0):.6f}s")
+            logger.info(f"✅ 完成: {profile} | {method} | DL={data.get('download_time',0):.4f}s | Decomp={data.get('decomp_time',0):.6f}s")
         else:
             logger.warning(f"❌ 失败: {method} | {error}")
-
-    def force_cleanup_images(self):
-        logger.info("🧹 执行深度清理...")
-        try:
-            self.docker_client.containers.prune()
-            self.docker_client.images.prune()
-            for img in TARGET_IMAGES:
-                try:
-                    self.docker_client.images.remove(img, force=True)
-                except: pass
-        except Exception as e:
-            logger.warning(f"清理过程遇到非致命错误: {e}")
 
     def cleanup(self):
         try: self.server.remove(force=True)
         except: pass
         try: self.network.remove()
         except: pass
-        self.force_cleanup_images()
-        logger.info("🧹 实验资源已清理完毕")
+        try:
+             self.docker_client.containers.prune()
+             self.docker_client.images.prune()
+        except: pass
+        logger.info("🧹 实验资源已清理")
 
     def run_matrix(self):
-        logger.info(f"🚀 开始全真网络仿真实验 (修正版)...")
+        logger.info(f"🚀 开始实验 (Pipe模式 + 20min超时)...")
         try:
             for image in TARGET_IMAGES:
                 try:
                     raw_path = None
                     raw_path, raw_size = self._pull_and_save_raw_tar(image)
-                    
                     for profile_name in CLIENT_PROFILES.keys():
                         config = CLIENT_PROFILES[profile_name]
                         self.update_server_network(config['bw'], config['delay'])
-                        
                         for method in COMPRESSION_METHODS.keys():
                             comp_path = None
                             try:
@@ -283,11 +263,8 @@ class ExperimentOrchestrator:
                                 for r in range(REPETITIONS):
                                     if not self.is_experiment_done(image, profile_name, method, r):
                                         needed_reps.append(r)
-                                
                                 if not needed_reps: continue
-
                                 comp_path, comp_size = self._create_compressed_payload(raw_path, method)
-                                
                                 for rep in needed_reps:
                                     logger.info(f"▶️  {image} | {profile_name} | {method} | Rep{rep}")
                                     try:
@@ -296,21 +273,17 @@ class ExperimentOrchestrator:
                                         self.save_result(image, profile_name, method, rep, result)
                                     except Exception as e:
                                         self.save_result(image, profile_name, method, rep, {}, error=e)
-                                    
                                     time.sleep(1)
                             except Exception as e:
-                                logger.error(f"处理压缩包失败: {e}")
+                                logger.error(f"处理失败: {e}")
                             finally:
                                 if comp_path and os.path.exists(comp_path):
                                     os.remove(comp_path)
                 except Exception as e:
                     logger.critical(f"🔥 镜像级错误 ({image}): {e}")
                 finally:
-                    if raw_path and os.path.exists(raw_path):
-                        os.remove(raw_path)
-                    try: 
-                        self.docker_client.images.remove(image, force=True)
-                        logger.info(f"🗑️ 已清理镜像层: {image}")
+                    if raw_path and os.path.exists(raw_path): os.remove(raw_path)
+                    try: self.docker_client.images.remove(image, force=True)
                     except: pass  
         finally:
             self.cleanup()
