@@ -8,7 +8,7 @@ import logging
 import subprocess
 import shutil
 import docker
-import numpy as np
+import uuid
 from config import CLIENT_PROFILES, TARGET_IMAGES, COMPRESSION_METHODS, REPETITIONS, DB_PATH, TEMP_DIR, CLIENT_IMAGE
 
 # === 日志配置 ===
@@ -66,13 +66,17 @@ class ExperimentOrchestrator:
         self.conn.commit()
 
     def _check_dependencies(self):
-        # 只要能运行 tar 即可
-        try:
-            subprocess.run(['tar', '--version'], check=True, stdout=subprocess.PIPE)
-            logger.info("✅ 环境依赖检查通过")
-        except:
-            logger.error("❌ 宿主机缺少 tar 工具")
+        required_tools = ['tar', 'gzip', 'zstd', 'lz4', 'brotli']
+        missing = []
+        for tool in required_tools:
+            if not shutil.which(tool):
+                missing.append(tool)
+        
+        if missing:
+            logger.error(f"❌ 宿主机缺少必要工具: {', '.join(missing)}")
+            logger.error("请安装: yum install -y tar gzip zstd lz4 brotli")
             sys.exit(1)
+        logger.info("✅ 环境依赖检查通过")
 
     def _setup_infrastructure(self):
         logger.info("🏗️  正在搭建实验网络架构...")
@@ -98,14 +102,24 @@ class ExperimentOrchestrator:
         time.sleep(2) 
 
     def update_server_network(self, bw, delay):
-        self.server.exec_run("tc qdisc del dev eth0 root")
-        cmd = f"tc qdisc add dev eth0 root netem rate {bw} delay {delay}"
-        exit_code, output = self.server.exec_run(cmd)
+        # 1. 清理旧规则 (忽略错误)
+        self.server.exec_run("tc qdisc del dev eth0 root", check=False)
+        
+        # 2. TBF 限速 (Token Bucket Filter)
+        cmd_tbf = f"tc qdisc add dev eth0 root handle 1: tbf rate {bw} burst 32kbit latency 400ms"
+        exit_code, output = self.server.exec_run(cmd_tbf)
+        if exit_code != 0:
+            logger.error(f"❌ TBF限速失败: {output.decode()}")
+            return
+
+        # 3. Netem 延迟 (挂载到 TBF 下)
+        cmd_netem = f"tc qdisc add dev eth0 parent 1:1 handle 10: netem delay {delay}"
+        exit_code, output = self.server.exec_run(cmd_netem)
         
         if exit_code != 0:
-            logger.error(f"❌ 网络配置失败: {output.decode()}")
+            logger.error(f"❌ Netem延迟失败: {output.decode()}")
         else:
-            logger.info(f"🌐 网络环境已更新: {bw} / {delay}")
+            logger.info(f"🌐 网络更新: {bw} + {delay}")
 
     def is_experiment_done(self, image, profile, method, rep):
         cursor = self.conn.cursor()
@@ -119,6 +133,7 @@ class ExperimentOrchestrator:
         safe_img_name = image_name.replace(':', '_').replace('/', '_')
         raw_tar_path = os.path.join(TEMP_DIR, f"{safe_img_name}_raw.tar")
         
+        # 即使文件存在，也检查大小，防止是坏文件
         if os.path.exists(raw_tar_path) and os.path.getsize(raw_tar_path) > 1000:
              return raw_tar_path, os.path.getsize(raw_tar_path)
 
@@ -131,16 +146,21 @@ class ExperimentOrchestrator:
             with open(raw_tar_path, 'wb') as f:
                 for chunk in image.save():
                     f.write(chunk)
+            
+            # 【优化】导出后立即删除 Docker 里的镜像层，节省空间
+            # self.docker_client.images.remove(image_name, force=True) 
+            # (注：暂不立即删，因为后面可能还要用 info，统一在循环末尾删)
+            
             return raw_tar_path, os.path.getsize(raw_tar_path)
         except Exception as e:
             if os.path.exists(raw_tar_path): os.remove(raw_tar_path)
             raise e
 
     def _create_compressed_payload(self, raw_tar_path, method_name):
-        # 统一处理：所有 config 里的命令现在都是 tar 格式
-        cmd_base = COMPRESSION_METHODS[method_name]
+        cmd_parts = COMPRESSION_METHODS[method_name]
+        prog = cmd_parts[0]
+        args = " ".join(cmd_parts[1:]) 
         
-        # 确定后缀
         if 'gzip' in method_name: ext = '.tar.gz'
         elif 'zstd' in method_name: ext = '.tar.zst'
         elif 'lz4' in method_name: ext = '.tar.lz4'
@@ -149,22 +169,15 @@ class ExperimentOrchestrator:
         
         compressed_path = raw_tar_path + ext
         
-        # 缓存检查
         if os.path.exists(compressed_path):
              return compressed_path, os.path.getsize(compressed_path)
 
         try:
-            # 关键修复：Config 提供了 ['tar', '-I', '...', '-cf']
-            # 我们需要补全命令： ... -cf [输出文件] [输入文件]
-            # 这样执行就是： tar -I ... -cf output.tar.gz input.tar
-            full_cmd = cmd_base + [compressed_path, raw_tar_path]
-            
-            # 使用 subprocess 调用，不再需要管道，因为 tar 自己处理文件IO
-            subprocess.run(full_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
+            # 构造 tar 命令: tar -I 'gzip -1' -cf out.tar.gz in.tar
+            tar_cmd = ['tar', '-I', f"{prog} {args}", '-cf', compressed_path, raw_tar_path]
+            subprocess.run(tar_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             return compressed_path, os.path.getsize(compressed_path)
         except subprocess.CalledProcessError as e:
-            # 捕获 tar 的错误输出方便调试
             error_msg = e.stderr.decode() if e.stderr else "Unknown error"
             logger.error(f"Compression failed for {method_name}: {error_msg}")
             if os.path.exists(compressed_path): os.remove(compressed_path)
@@ -174,15 +187,13 @@ class ExperimentOrchestrator:
         config = CLIENT_PROFILES[profile_name]
         filename = os.path.basename(compressed_file)
         target_url = f"http://{self.server_ip}:{self.server_port}/{filename}"
-        container_name = f"cts_worker_{profile_name}"
-
-        try:
-            self.docker_client.containers.get(container_name).remove(force=True)
-        except: pass
+        
+        # 【关键修复】UUID 随机后缀，防止容器重名冲突
+        random_suffix = uuid.uuid4().hex[:6]
+        container_name = f"cts_worker_{profile_name}_{random_suffix}"
 
         container = None
         try:
-            # 路径已修复
             container = self.docker_client.containers.run(
                 CLIENT_IMAGE,
                 name=container_name,
@@ -196,14 +207,20 @@ class ExperimentOrchestrator:
                 command="tail -f /dev/null"
             )
             
-            cmd = f"python3 /app/client_agent.py {target_url} --method {method_name}"
-            exec_result = container.exec_run(cmd)
-            output = exec_result.output.decode('utf-8', errors='ignore')
+            # 【优化】带超时限制 (300秒) + 结果写入文件
+            cmd = f"timeout 300 python3 /app/client_agent.py {target_url} --method {method_name}"
+            exec_res = container.exec_run(f"sh -c '{cmd}'")
             
-            if exec_result.exit_code != 0:
-                raise Exception(f"Agent Error: {output[-300:]}")
-            
-            return json.loads(output.strip().split('\n')[-1])
+            if exec_res.exit_code != 0:
+                err_log = exec_res.output.decode('utf-8', errors='ignore')
+                raise Exception(f"Agent Execution Failed: {err_log[-200:]}")
+
+            # 读取结果文件
+            cat_res = container.exec_run("cat /tmp/result.json")
+            if cat_res.exit_code != 0:
+                 raise Exception("Result file not found")
+                 
+            return json.loads(cat_res.output.decode('utf-8').strip())
 
         finally:
             if container: 
@@ -235,20 +252,37 @@ class ExperimentOrchestrator:
         else:
             logger.warning(f"❌ 失败: {method} | {error}")
 
+    def force_cleanup_images(self):
+        """【关键修复】激进的清理逻辑，防止磁盘爆满"""
+        logger.info("🧹 执行深度清理...")
+        try:
+            # 1. 尝试清理所有已停止的容器
+            self.docker_client.containers.prune()
+            # 2. 清理悬空的镜像 (dangling)
+            self.docker_client.images.prune()
+            # 3. 显式清理目标镜像 (在 config.TARGET_IMAGES 里的)
+            for img in TARGET_IMAGES:
+                try:
+                    self.docker_client.images.remove(img, force=True)
+                except: pass
+        except Exception as e:
+            logger.warning(f"清理过程遇到非致命错误: {e}")
+
     def cleanup(self):
         try: self.server.remove(force=True)
         except: pass
         try: self.network.remove()
         except: pass
-        logger.info("🧹 实验资源已清理")
+        # 执行深度清理
+        self.force_cleanup_images()
+        logger.info("🧹 实验资源已清理完毕")
 
     def run_matrix(self):
-        logger.info(f"🚀 开始全真网络仿真实验...")
+        logger.info(f"🚀 开始全真网络仿真实验 (最终版)...")
         try:
             for image in TARGET_IMAGES:
                 try:
-                    # 关键修改：comp_path 初始化，防止 UnboundLocalError
-                    raw_path = None 
+                    raw_path = None
                     raw_path, raw_size = self._pull_and_save_raw_tar(image)
                     
                     for profile_name in CLIENT_PROFILES.keys():
@@ -256,7 +290,7 @@ class ExperimentOrchestrator:
                         self.update_server_network(config['bw'], config['delay'])
                         
                         for method in COMPRESSION_METHODS.keys():
-                            comp_path = None # 每次循环重置
+                            comp_path = None
                             try:
                                 needed_reps = []
                                 for r in range(REPETITIONS):
@@ -285,9 +319,13 @@ class ExperimentOrchestrator:
                 except Exception as e:
                     logger.critical(f"🔥 镜像级错误 ({image}): {e}")
                 finally:
+                    # 跑完一个镜像，立马删掉原始文件，释放 40G 硬盘的压力
                     if raw_path and os.path.exists(raw_path):
                         os.remove(raw_path)
-                    try: self.docker_client.images.remove(image, force=True)
+                    try: 
+                        # 尝试立刻删除该镜像的 Docker 层
+                        self.docker_client.images.remove(image, force=True)
+                        logger.info(f"🗑️ 已清理镜像层: {image}")
                     except: pass  
         finally:
             self.cleanup()
