@@ -59,17 +59,22 @@ CLIENT_PROFILES = {
 # 确保其他配置保持不变...
 # === 目标镜像列表 (18个) ===
 TARGET_IMAGES = [
-    # Linux 发行版
-    'centos:latest', 'fedora:latest', 'ubuntu:latest',
-    # 数据库
+    # Linux 发行版 (CentOS 换成了更稳定的 Stream 9)
+    'quay.io/centos/centos:stream9', 'fedora:latest', 'ubuntu:latest',
+    
+    # 数据库 (保持不变，够用)
     'mongo:latest', 'mysql:latest', 'postgres:latest',
-    # 编程语言
+    
+    # 编程语言 (保持不变)
     'rust:latest', 'ruby:latest', 'python:latest',
-    # Web 组件
-    'nginx:latest', 'httpd:latest', 'tomcat:latest',
-    # 应用平台
+    
+    # Web 组件 (Tomcat 和 Httpd 重复度高，删一个 Tomcat 省时间)
+    'nginx:latest', 'httpd:latest', #'tomcat:latest', 
+    
+    # 应用平台 (保持不变)
     'rabbitmq:latest', 'wordpress:latest', 'nextcloud:latest',
-    # 应用工具
+    
+    # 应用工具 (Gradle 和 Rust 都是巨型镜像，保留做压力测试)
     'gradle:latest', 'node:latest'
 ]
 
