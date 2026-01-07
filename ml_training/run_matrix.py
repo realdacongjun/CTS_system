@@ -240,7 +240,7 @@ class ExperimentOrchestrator:
         ))
         self.conn.commit()
         if status == 'SUCCESS':
-            logger.info(f"✅ 完成: {profile} | {method} | DL={data.get('download_time',0):.2f}s | Decomp={data.get('decomp_time',0):.2f}s")
+            logger.info(f"✅ 完成: {profile} | {method} | DL={data.get('download_time',0):.2f}s | Decomp={data.get('decomp_time',0):.6f}s")
         else:
             logger.warning(f"❌ 失败: {method} | {error}")
 

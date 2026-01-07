@@ -9,12 +9,15 @@ import sys
 import urllib.request 
 
 def run_command(cmd):
-    start = time.time()
+    # 【升级点】使用 perf_counter 获取纳秒级精度
+    start = time.perf_counter()
     subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL)
-    return time.time() - start
+    end = time.perf_counter()
+    return end - start
 
 def download_file(url, save_path):
-    start = time.time()
+    # 【升级点】同上，保证下载时间也更精准
+    start = time.perf_counter()
     chunk_size = 1024 * 1024 
     try:
         with urllib.request.urlopen(url) as response:
@@ -25,7 +28,7 @@ def download_file(url, save_path):
                     f.write(chunk)
     except Exception as e:
         raise RuntimeError(f"Download failed: {str(e)}")
-    return time.time() - start
+    return time.perf_counter() - start
 
 def main():
     parser = argparse.ArgumentParser()
@@ -36,7 +39,7 @@ def main():
     filename = args.url.split('/')[-1]
     local_compressed_path = f"/tmp/{filename}"
     output_dir = "/tmp/output_data"
-    result_file = "/tmp/result.json" # 结果写入文件
+    result_file = "/tmp/result.json"
     
     if os.path.exists(output_dir): shutil.rmtree(output_dir)
     os.makedirs(output_dir)
@@ -52,7 +55,6 @@ def main():
         result["download_time"] = dl_time
 
         cmd = ""
-        # 针对不同压缩格式的解压命令
         if args.method.startswith('gzip'):
             cmd = f"tar -xzf {local_compressed_path} -C {output_dir}"
         elif args.method.startswith('brotli'):
@@ -65,6 +67,11 @@ def main():
             cmd = f"tar -xf {local_compressed_path} -C {output_dir}"
 
         decomp_time = run_command(cmd)
+        
+        # 【兜底策略】如果 perf_counter 依然测出 0 (极罕见)，强制给一个极小值
+        if decomp_time == 0:
+            decomp_time = 0.000001 # 1微秒
+            
         result["decomp_time"] = decomp_time
         result["total_time"] = dl_time + decomp_time
         result["status"] = "SUCCESS"
@@ -73,12 +80,10 @@ def main():
         result["error"] = str(e)
     
     finally:
-        # 清理
         if os.path.exists(local_compressed_path): os.remove(local_compressed_path)
         if os.path.exists(output_dir): shutil.rmtree(output_dir)
         if os.path.exists("/tmp/temp.tar"): os.remove("/tmp/temp.tar")
 
-    # 关键修改：将结果写入文件，而不是打印到 stdout
     with open(result_file, "w") as f:
         json.dump(result, f)
 
