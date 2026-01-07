@@ -100,7 +100,9 @@ class ExperimentOrchestrator:
         time.sleep(2) 
 
     def update_server_network(self, bw, delay):
-        self.server.exec_run("tc qdisc del dev eth0 root", check=False)
+        # 【修复点】这里删除了 check=False，因为 exec_run 不支持该参数
+        self.server.exec_run("tc qdisc del dev eth0 root")
+        
         cmd_tbf = f"tc qdisc add dev eth0 root handle 1: tbf rate {bw} burst 32kbit latency 400ms"
         exit_code, output = self.server.exec_run(cmd_tbf)
         if exit_code != 0:
@@ -152,13 +154,10 @@ class ExperimentOrchestrator:
              return compressed_path, os.path.getsize(compressed_path)
 
         try:
-            # 【核心修复】改为管道操作，100% 避免参数解析错误！
-            # 命令示例: tar -cf - raw.tar | lz4 -3 --force > compressed.tar.lz4
+            # 管道模式，绝对稳健
             pipe_cmd = f"tar -cf - {raw_tar_path} | {prog} {args} > {compressed_path}"
-            
             subprocess.run(pipe_cmd, shell=True, check=True, executable='/bin/bash')
             
-            # 【双重保险】检查文件是否为 0 字节
             if not os.path.exists(compressed_path) or os.path.getsize(compressed_path) < 100:
                 raise Exception("Compressed file is empty or too small (Compression Failed)!")
                 
@@ -175,7 +174,6 @@ class ExperimentOrchestrator:
         random_suffix = uuid.uuid4().hex[:6]
         container_name = f"cts_worker_{profile_name}_{random_suffix}"
         
-        # 强制绝对路径
         agent_host_path = "/root/CTS_system/ml_training/client_agent.py"
         if not os.path.exists(agent_host_path):
             raise Exception(f"Client agent not found at {agent_host_path}")
@@ -195,7 +193,7 @@ class ExperimentOrchestrator:
                 command="tail -f /dev/null"
             )
             
-            # 【核心修复】超时延长至 1200秒 (20分钟)
+            # 超时 1200秒
             cmd = f"timeout 1200 python3 /app/client_agent.py {target_url} --method {method_name}"
             exec_res = container.exec_run(f"sh -c '{cmd}'")
             
@@ -247,7 +245,7 @@ class ExperimentOrchestrator:
         logger.info("🧹 实验资源已清理")
 
     def run_matrix(self):
-        logger.info(f"🚀 开始实验 (Pipe模式 + 20min超时)...")
+        logger.info(f"🚀 开始实验 (Pipeline + 20min + Fixes)...")
         try:
             for image in TARGET_IMAGES:
                 try:
