@@ -1,4 +1,3 @@
-
 import os
 import sys
 import time
@@ -9,6 +8,7 @@ import subprocess
 import shutil
 import docker
 import uuid
+import re  # <--- 新增正则模块，用于解析带宽数字
 from config import CLIENT_PROFILES, TARGET_IMAGES, COMPRESSION_METHODS, REPETITIONS, DB_PATH, TEMP_DIR, CLIENT_IMAGE
 
 # === 日志配置 ===
@@ -41,6 +41,7 @@ class ExperimentOrchestrator:
 
     def _init_db(self):
         cursor = self.conn.cursor()
+        # 增加 cpu_limit, mem_limit_mb, network_bw, network_delay 四列
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS experiments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,6 +58,13 @@ class ExperimentOrchestrator:
                 compressed_size INTEGER,
                 original_size INTEGER,
                 bandwidth_measured REAL,
+                
+                -- 【新增配置列】让数据自解释 --
+                cpu_limit REAL,
+                mem_limit_mb INTEGER,
+                network_bw INTEGER,
+                network_delay INTEGER,
+                
                 is_noise BOOLEAN,
                 error_msg TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -100,7 +108,6 @@ class ExperimentOrchestrator:
         time.sleep(2) 
 
     def update_server_network(self, bw, delay):
-        # 【修复点】这里删除了 check=False，因为 exec_run 不支持该参数
         self.server.exec_run("tc qdisc del dev eth0 root")
         
         cmd_tbf = f"tc qdisc add dev eth0 root handle 1: tbf rate {bw} burst 32kbit latency 400ms"
@@ -210,26 +217,48 @@ class ExperimentOrchestrator:
                 try: container.remove(force=True)
                 except: pass
 
-    def save_result(self, image, profile, method, rep, data, error=None):
+    # 【重要修复】这里增加了 config 参数，并解析其中的配置写入数据库
+    def save_result(self, image, profile, method, rep, data, config, error=None):
         status = 'FAILED' if error else 'SUCCESS'
+        
+        # 解析配置中的数字 (e.g., "20mbit" -> 20)
+        try:
+            bw_val = int(re.search(r'\d+', str(config.get('bw', '0'))).group())
+            delay_val = int(re.search(r'\d+', str(config.get('delay', '0'))).group())
+            # 处理内存：如果是 4g -> 4, 2048m -> 2048。
+            # 这里简单存数字，训练时自己归一化即可
+            mem_val = int(re.search(r'\d+', str(config.get('mem', '0'))).group())
+        except:
+            bw_val, delay_val, mem_val = 0, 0, 0
+
         cursor = self.conn.cursor()
         cursor.execute('''
             INSERT OR REPLACE INTO experiments 
             (image, client_profile, method, rep_id, status, download_time, decomp_time, 
              total_time, cpu_usage, mem_usage, compressed_size, original_size, 
-             bandwidth_measured, is_noise, error_msg)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             bandwidth_measured, 
+             cpu_limit, mem_limit_mb, network_bw, network_delay,
+             is_noise, error_msg)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             image, profile, method, rep, status,
             data.get('download_time', 0), data.get('decomp_time', 0),
             data.get('total_time', 0), data.get('cpu_usage', 0),
             data.get('mem_usage', 0), data.get('compressed_size', 0),
             data.get('original_size', 0), data.get('bandwidth_measured', 0),
+            
+            # 写入配置数值
+            config.get('cpu', 0),
+            mem_val,
+            bw_val,
+            delay_val,
+            
             False, str(error) if error else None
         ))
         self.conn.commit()
         if status == 'SUCCESS':
-            logger.info(f"✅ 完成: {profile} | {method} | DL={data.get('download_time',0):.4f}s | Decomp={data.get('decomp_time',0):.6f}s")
+            # 日志带上配置信息，看着更清楚
+            logger.info(f"✅ 完成: {profile}({config['bw']}) | {method} | DL={data.get('download_time',0):.4f}s | Decomp={data.get('decomp_time',0):.6f}s")
         else:
             logger.warning(f"❌ 失败: {method} | {error}")
 
@@ -245,7 +274,7 @@ class ExperimentOrchestrator:
         logger.info("🧹 实验资源已清理")
 
     def run_matrix(self):
-        logger.info(f"🚀 开始实验 (Pipeline + 20min + Fixes)...")
+        logger.info(f"🚀 开始实验 (Pipeline + 20min + ConfigRecord)...")
         try:
             for image in TARGET_IMAGES:
                 try:
@@ -268,9 +297,11 @@ class ExperimentOrchestrator:
                                     try:
                                         result = self.run_agent_in_container(profile_name, comp_path, method)
                                         result.update({'original_size': raw_size, 'compressed_size': comp_size})
-                                        self.save_result(image, profile_name, method, rep, result)
+                                        # 【重要修复】把 config 传进去
+                                        self.save_result(image, profile_name, method, rep, result, config)
                                     except Exception as e:
-                                        self.save_result(image, profile_name, method, rep, {}, error=e)
+                                        # 【重要修复】错误时也传 config
+                                        self.save_result(image, profile_name, method, rep, {}, config, error=e)
                                     time.sleep(1)
                             except Exception as e:
                                 logger.error(f"处理失败: {e}")
