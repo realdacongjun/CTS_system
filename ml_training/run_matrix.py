@@ -102,17 +102,18 @@ class ExperimentOrchestrator:
         time.sleep(2) 
 
     def update_server_network(self, bw, delay):
-        # 1. 清理旧规则 (忽略错误)
-        self.server.exec_run("tc qdisc del dev eth0 root", check=False)
+        # 【修复点】删除了 check=False，因为 exec_run 不支持该参数
+        # 1. 清理旧规则 (忽略返回值即可)
+        self.server.exec_run("tc qdisc del dev eth0 root")
         
-        # 2. TBF 限速 (Token Bucket Filter)
+        # 2. TBF 限速
         cmd_tbf = f"tc qdisc add dev eth0 root handle 1: tbf rate {bw} burst 32kbit latency 400ms"
         exit_code, output = self.server.exec_run(cmd_tbf)
         if exit_code != 0:
             logger.error(f"❌ TBF限速失败: {output.decode()}")
             return
 
-        # 3. Netem 延迟 (挂载到 TBF 下)
+        # 3. Netem 延迟
         cmd_netem = f"tc qdisc add dev eth0 parent 1:1 handle 10: netem delay {delay}"
         exit_code, output = self.server.exec_run(cmd_netem)
         
@@ -133,7 +134,6 @@ class ExperimentOrchestrator:
         safe_img_name = image_name.replace(':', '_').replace('/', '_')
         raw_tar_path = os.path.join(TEMP_DIR, f"{safe_img_name}_raw.tar")
         
-        # 即使文件存在，也检查大小，防止是坏文件
         if os.path.exists(raw_tar_path) and os.path.getsize(raw_tar_path) > 1000:
              return raw_tar_path, os.path.getsize(raw_tar_path)
 
@@ -146,10 +146,6 @@ class ExperimentOrchestrator:
             with open(raw_tar_path, 'wb') as f:
                 for chunk in image.save():
                     f.write(chunk)
-            
-            # 【优化】导出后立即删除 Docker 里的镜像层，节省空间
-            # self.docker_client.images.remove(image_name, force=True) 
-            # (注：暂不立即删，因为后面可能还要用 info，统一在循环末尾删)
             
             return raw_tar_path, os.path.getsize(raw_tar_path)
         except Exception as e:
@@ -173,7 +169,6 @@ class ExperimentOrchestrator:
              return compressed_path, os.path.getsize(compressed_path)
 
         try:
-            # 构造 tar 命令: tar -I 'gzip -1' -cf out.tar.gz in.tar
             tar_cmd = ['tar', '-I', f"{prog} {args}", '-cf', compressed_path, raw_tar_path]
             subprocess.run(tar_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             return compressed_path, os.path.getsize(compressed_path)
@@ -188,7 +183,6 @@ class ExperimentOrchestrator:
         filename = os.path.basename(compressed_file)
         target_url = f"http://{self.server_ip}:{self.server_port}/{filename}"
         
-        # 【关键修复】UUID 随机后缀，防止容器重名冲突
         random_suffix = uuid.uuid4().hex[:6]
         container_name = f"cts_worker_{profile_name}_{random_suffix}"
 
@@ -207,7 +201,6 @@ class ExperimentOrchestrator:
                 command="tail -f /dev/null"
             )
             
-            # 【优化】带超时限制 (300秒) + 结果写入文件
             cmd = f"timeout 300 python3 /app/client_agent.py {target_url} --method {method_name}"
             exec_res = container.exec_run(f"sh -c '{cmd}'")
             
@@ -215,7 +208,6 @@ class ExperimentOrchestrator:
                 err_log = exec_res.output.decode('utf-8', errors='ignore')
                 raise Exception(f"Agent Execution Failed: {err_log[-200:]}")
 
-            # 读取结果文件
             cat_res = container.exec_run("cat /tmp/result.json")
             if cat_res.exit_code != 0:
                  raise Exception("Result file not found")
@@ -253,14 +245,10 @@ class ExperimentOrchestrator:
             logger.warning(f"❌ 失败: {method} | {error}")
 
     def force_cleanup_images(self):
-        """【关键修复】激进的清理逻辑，防止磁盘爆满"""
         logger.info("🧹 执行深度清理...")
         try:
-            # 1. 尝试清理所有已停止的容器
             self.docker_client.containers.prune()
-            # 2. 清理悬空的镜像 (dangling)
             self.docker_client.images.prune()
-            # 3. 显式清理目标镜像 (在 config.TARGET_IMAGES 里的)
             for img in TARGET_IMAGES:
                 try:
                     self.docker_client.images.remove(img, force=True)
@@ -273,12 +261,11 @@ class ExperimentOrchestrator:
         except: pass
         try: self.network.remove()
         except: pass
-        # 执行深度清理
         self.force_cleanup_images()
         logger.info("🧹 实验资源已清理完毕")
 
     def run_matrix(self):
-        logger.info(f"🚀 开始全真网络仿真实验 (最终版)...")
+        logger.info(f"🚀 开始全真网络仿真实验 (修正版)...")
         try:
             for image in TARGET_IMAGES:
                 try:
@@ -319,11 +306,9 @@ class ExperimentOrchestrator:
                 except Exception as e:
                     logger.critical(f"🔥 镜像级错误 ({image}): {e}")
                 finally:
-                    # 跑完一个镜像，立马删掉原始文件，释放 40G 硬盘的压力
                     if raw_path and os.path.exists(raw_path):
                         os.remove(raw_path)
                     try: 
-                        # 尝试立刻删除该镜像的 Docker 层
                         self.docker_client.images.remove(image, force=True)
                         logger.info(f"🗑️ 已清理镜像层: {image}")
                     except: pass  
