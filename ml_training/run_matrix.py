@@ -1,3 +1,4 @@
+cat > run_matrix.py << 'EOF'
 import os
 import sys
 import time
@@ -65,11 +66,12 @@ class ExperimentOrchestrator:
         self.conn.commit()
 
     def _check_dependencies(self):
+        # 只要能运行 tar 即可
         try:
-            subprocess.run(['lz4', '--version'], check=True, stdout=subprocess.PIPE)
+            subprocess.run(['tar', '--version'], check=True, stdout=subprocess.PIPE)
             logger.info("✅ 环境依赖检查通过")
         except:
-            logger.error("❌ 宿主机缺少 lz4 工具")
+            logger.error("❌ 宿主机缺少 tar 工具")
             sys.exit(1)
 
     def _setup_infrastructure(self):
@@ -135,28 +137,36 @@ class ExperimentOrchestrator:
             raise e
 
     def _create_compressed_payload(self, raw_tar_path, method_name):
-        cmd_args = COMPRESSION_METHODS[method_name]
-        if 'gzip' in method_name: ext = '.gz'
-        elif 'zstd' in method_name: ext = '.zst'
-        elif 'lz4' in method_name: ext = '.lz4'
-        elif 'brotli' in method_name: ext = '.br'
-        else: ext = '.dat'
+        # 统一处理：所有 config 里的命令现在都是 tar 格式
+        cmd_base = COMPRESSION_METHODS[method_name]
+        
+        # 确定后缀
+        if 'gzip' in method_name: ext = '.tar.gz'
+        elif 'zstd' in method_name: ext = '.tar.zst'
+        elif 'lz4' in method_name: ext = '.tar.lz4'
+        elif 'brotli' in method_name: ext = '.tar.br'
+        else: ext = '.tar'
         
         compressed_path = raw_tar_path + ext
+        
+        # 缓存检查
         if os.path.exists(compressed_path):
              return compressed_path, os.path.getsize(compressed_path)
 
         try:
-            if 'lz4' in method_name:
-                subprocess.run(cmd_args + [raw_tar_path, compressed_path], check=True)
-            elif 'zstd' in method_name:
-                subprocess.run(cmd_args + [raw_tar_path, '-o', compressed_path], check=True)
-            else:
-                 with open(raw_tar_path, 'rb') as f_in, open(compressed_path, 'wb') as f_out:
-                    subprocess.run(cmd_args, stdin=f_in, stdout=f_out, check=True)
+            # 关键修复：Config 提供了 ['tar', '-I', '...', '-cf']
+            # 我们需要补全命令： ... -cf [输出文件] [输入文件]
+            # 这样执行就是： tar -I ... -cf output.tar.gz input.tar
+            full_cmd = cmd_base + [compressed_path, raw_tar_path]
+            
+            # 使用 subprocess 调用，不再需要管道，因为 tar 自己处理文件IO
+            subprocess.run(full_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
             return compressed_path, os.path.getsize(compressed_path)
-        except Exception as e:
+        except subprocess.CalledProcessError as e:
+            # 捕获 tar 的错误输出方便调试
+            error_msg = e.stderr.decode() if e.stderr else "Unknown error"
+            logger.error(f"Compression failed for {method_name}: {error_msg}")
             if os.path.exists(compressed_path): os.remove(compressed_path)
             raise e
 
@@ -166,14 +176,13 @@ class ExperimentOrchestrator:
         target_url = f"http://{self.server_ip}:{self.server_port}/{filename}"
         container_name = f"cts_worker_{profile_name}"
 
-        # 【修复点 1】: 预先清理可能残留的同名容器，防止Conflict
         try:
             self.docker_client.containers.get(container_name).remove(force=True)
         except: pass
 
         container = None
         try:
-            # 【修复点 2】: 路径改为当前目录 os.path.abspath("client_agent.py")
+            # 路径已修复
             container = self.docker_client.containers.run(
                 CLIENT_IMAGE,
                 name=container_name,
@@ -222,7 +231,7 @@ class ExperimentOrchestrator:
         ))
         self.conn.commit()
         if status == 'SUCCESS':
-            logger.info(f"✅ 完成: Rep{rep} | DL={data.get('download_time',0):.2f}s | Decomp={data.get('decomp_time',0):.2f}s")
+            logger.info(f"✅ 完成: {profile} | {method} | DL={data.get('download_time',0):.2f}s | Decomp={data.get('decomp_time',0):.2f}s")
         else:
             logger.warning(f"❌ 失败: {method} | {error}")
 
@@ -238,6 +247,8 @@ class ExperimentOrchestrator:
         try:
             for image in TARGET_IMAGES:
                 try:
+                    # 关键修改：comp_path 初始化，防止 UnboundLocalError
+                    raw_path = None 
                     raw_path, raw_size = self._pull_and_save_raw_tar(image)
                     
                     for profile_name in CLIENT_PROFILES.keys():
@@ -245,6 +256,7 @@ class ExperimentOrchestrator:
                         self.update_server_network(config['bw'], config['delay'])
                         
                         for method in COMPRESSION_METHODS.keys():
+                            comp_path = None # 每次循环重置
                             try:
                                 needed_reps = []
                                 for r in range(REPETITIONS):
@@ -265,13 +277,15 @@ class ExperimentOrchestrator:
                                         self.save_result(image, profile_name, method, rep, {}, error=e)
                                     
                                     time.sleep(1)
+                            except Exception as e:
+                                logger.error(f"处理压缩包失败: {e}")
                             finally:
                                 if comp_path and os.path.exists(comp_path):
                                     os.remove(comp_path)
                 except Exception as e:
                     logger.critical(f"🔥 镜像级错误 ({image}): {e}")
                 finally:
-                    if 'raw_path' in locals() and os.path.exists(raw_path):
+                    if raw_path and os.path.exists(raw_path):
                         os.remove(raw_path)
                     try: self.docker_client.images.remove(image, force=True)
                     except: pass  
@@ -284,3 +298,4 @@ if __name__ == "__main__":
         orchestrator.run_matrix()
     except KeyboardInterrupt:
         orchestrator.cleanup()
+EOF
