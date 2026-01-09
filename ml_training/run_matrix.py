@@ -217,16 +217,15 @@ class ExperimentOrchestrator:
                 try: container.remove(force=True)
                 except: pass
 
-    # 【重要修复】这里增加了 config 参数，并解析其中的配置写入数据库
+ 
     def save_result(self, image, profile, method, rep, data, config, error=None):
         status = 'FAILED' if error else 'SUCCESS'
         
-        # 解析配置中的数字 (e.g., "20mbit" -> 20)
+
         try:
             bw_val = int(re.search(r'\d+', str(config.get('bw', '0'))).group())
             delay_val = int(re.search(r'\d+', str(config.get('delay', '0'))).group())
-            # 处理内存：如果是 4g -> 4, 2048m -> 2048。
-            # 这里简单存数字，训练时自己归一化即可
+
             mem_val = int(re.search(r'\d+', str(config.get('mem', '0'))).group())
         except:
             bw_val, delay_val, mem_val = 0, 0, 0
@@ -257,7 +256,7 @@ class ExperimentOrchestrator:
         ))
         self.conn.commit()
         if status == 'SUCCESS':
-            # 日志带上配置信息，看着更清楚
+            # 日志带上配置信息
             logger.info(f"✅ 完成: {profile}({config['bw']}) | {method} | DL={data.get('download_time',0):.4f}s | Decomp={data.get('decomp_time',0):.6f}s")
         else:
             logger.warning(f"❌ 失败: {method} | {error}")
@@ -297,10 +296,8 @@ class ExperimentOrchestrator:
                                     try:
                                         result = self.run_agent_in_container(profile_name, comp_path, method)
                                         result.update({'original_size': raw_size, 'compressed_size': comp_size})
-                                        # 【重要修复】把 config 传进去
                                         self.save_result(image, profile_name, method, rep, result, config)
                                     except Exception as e:
-                                        # 【重要修复】错误时也传 config
                                         self.save_result(image, profile_name, method, rep, {}, config, error=e)
                                     time.sleep(1)
                             except Exception as e:
