@@ -1,8 +1,7 @@
 # 基础镜像
 FROM python:3.9-slim
 
-# 1. 换源（适配 Debian 12 Bookworm）并安装系统依赖
-# 注意：这里增加了 zstd 和 lz4 (命令行工具)，不仅仅是 dev 库
+# 1. 换源并安装系统依赖 (关键：增加了 zstd 和 lz4)
 RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources && \
     apt-get update && apt-get install -y \
     liblz4-dev \
@@ -13,8 +12,7 @@ RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debi
     lz4 \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. 安装Python依赖 (保持不变)
-# 注意：这些是 Python 库，用于 import 用的，跟 shell 里的命令无关
+# 2. 安装Python依赖
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
     zstandard==0.19.0 \
     lz4==4.0.0 \
@@ -25,8 +23,9 @@ RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
 # 设置工作目录
 WORKDIR /app
 
-# 复制脚本
-COPY client_agent.py .
+# 【关键修改】修正复制路径
+# 因为构建要在根目录进行，而脚本在 ml_training 文件夹里
+COPY ml_training/client_agent.py .
 
 # 3. 容器默认挂机
 CMD ["tail", "-f", "/dev/null"]
