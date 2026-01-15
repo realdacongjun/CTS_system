@@ -14,7 +14,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import json
-from .config import get_client_capabilities, get_image_profiles, get_compression_config
+from ..collection.config import get_client_capabilities, get_image_profiles, get_compression_config
 
 
 class ModelTrainer:
@@ -357,7 +357,7 @@ def generate_sample_data() -> List[Tuple]:
     sample_data = []
     
     # 使用配置中的实验设计参数
-    from .config import CLIENT_CAPABILITIES, IMAGE_PROFILES, COMPRESSION_CONFIG
+    from ..collection.config import CLIENT_CAPABILITIES, IMAGE_PROFILES, COMPRESSION_CONFIG
     
     # 生成实验设计中的数据
     for client_profile in CLIENT_CAPABILITIES['profiles']:

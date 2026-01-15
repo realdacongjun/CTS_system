@@ -12,7 +12,7 @@ from typing import List, Tuple, Dict, Any
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import matplotlib.pyplot as plt
 import json
-from .config import get_client_capabilities, get_image_profiles, get_compression_config
+from ..collection.config import get_client_capabilities, get_image_profiles, get_compression_config
 
 
 class ModelEvaluator:
@@ -551,7 +551,7 @@ def generate_test_data() -> List[Tuple]:
     test_data = []
     
     # 使用配置中的实验设计参数
-    from .config import CLIENT_CAPABILITIES, IMAGE_PROFILES, COMPRESSION_CONFIG
+    from ..collection.config import CLIENT_CAPABILITIES, IMAGE_PROFILES, COMPRESSION_CONFIG
     
     # 生成实验设计中的数据
     for client_profile in CLIENT_CAPABILITIES['profiles'][:2]:  # 只取前2个配置以减少测试数据量

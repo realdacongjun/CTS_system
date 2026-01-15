@@ -9,7 +9,7 @@ import os
 import json
 from pathlib import Path
 import tempfile
-from ml_training.config import get_client_capabilities, get_image_profiles, get_compression_config
+from ml_training.collection.config import get_client_capabilities, get_image_profiles, get_compression_config
 from ml_training.exp_orchestrator import ExperimentOrchestrator
 
 

@@ -9,7 +9,7 @@ import shutil
 import docker
 import uuid
 import re  # <--- 新增正则模块，用于解析带宽数字
-from config import CLIENT_PROFILES, TARGET_IMAGES, COMPRESSION_METHODS, REPETITIONS, DB_PATH, TEMP_DIR, CLIENT_IMAGE
+from ml_training.collection.config import CLIENT_PROFILES, TARGET_IMAGES, COMPRESSION_METHODS, REPETITIONS, DB_PATH, TEMP_DIR, CLIENT_IMAGE
 
 # === 日志配置 ===
 logging.basicConfig(

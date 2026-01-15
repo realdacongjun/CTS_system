@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import sqlite3
-from .config import get_client_capabilities, get_image_profiles, get_compression_config, DATA_COLLECTION_CONFIG
+from ..collection.config import get_client_capabilities, get_image_profiles, get_compression_config, DATA_COLLECTION_CONFIG
 
 
 class DataCollector:

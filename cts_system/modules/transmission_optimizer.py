@@ -30,7 +30,6 @@ class PullPredictor:
     def record_pull(self, image_name, timestamp=None):
         """
         记录镜像拉取事件
-        
         Args:
             image_name: 镜像名称
             timestamp: 拉取时间戳
