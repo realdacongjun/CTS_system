@@ -1,379 +1,288 @@
-"""
-决策模型训练模块
-功能：训练双塔MLP模型用于压缩策略决策
-输入：客户端画像、镜像特征、实际成本、使用方法
-输出：训练好的MLP模型和特征缩放器
-"""
-
-import os
-import pickle
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
 import numpy as np
-from typing import List, Tuple, Dict, Any
-from sklearn.neural_network import MLPRegressor
-from sklearn.preprocessing import StandardScaler
+import os
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-import json
-from ..collection.config import get_client_capabilities, get_image_profiles, get_compression_config
 
+# ==============================================================================
+# 1. 配置区域 (Hyperparameters)
+# ==============================================================================
+CONFIG = {
+    "data_path": "cts_data.xlsx",         
+    "feature_path": "image_features_database.csv",
+    "batch_size": 64,
+    "lr": 0.001,
+    "epochs": 200,             # 增加训练轮数，让模型充分训练
+    "embed_dim": 32,
+    "kl_coeff": 0.15,          # [调整] 增加正则化权重，让不确定性更准确
+    "model_save_path": "cts_best_model_full.pth" 
+}
 
-class ModelTrainer:
-    """决策模型训练器"""
+# 路径检查与自动修正 (解决你的路径烦恼)
+# 如果当前目录下找不到，尝试去上一级目录找
+if not os.path.exists(CONFIG["data_path"]):
+    if os.path.exists(f"../{CONFIG['data_path']}"):
+        CONFIG["data_path"] = f"../{CONFIG['data_path']}"
+        CONFIG["feature_path"] = f"../{CONFIG['feature_path']}"
+        print(f"📂 自动切换数据路径到上一级: {CONFIG['data_path']}")
+
+# ==============================================================================
+# 🌟 核心新增: 证据深度学习损失函数 (NIG Loss)
+# ==============================================================================
+# 参考文献: Deep Evidential Regression (Amini et al., NeurIPS 2020)
+def nig_nll_loss(y, gamma, v, alpha, beta):
+    """计算负对数似然损失 (NLL): 让预测值(gamma)接近真实值(y)"""
+    two_blambda = 2 * beta * (1 + v)
+    nll = 0.5 * torch.log(np.pi / v) \
+        - alpha * torch.log(two_blambda) \
+        + (alpha + 0.5) * torch.log(v * (y - gamma)**2 + two_blambda) \
+        + torch.lgamma(alpha) - torch.lgamma(alpha + 0.5)
+    return nll.mean()
+
+def nig_reg_loss(y, gamma, v, alpha, beta):
+    """计算正则化损失: 惩罚模型在预测错误时还盲目自信"""
+    error = torch.abs(y - gamma)
+    evidence = 2 * v + alpha
+    return (error * evidence).mean()
+
+def evidential_loss(pred, target, epoch, total_epochs, lambda_coef=CONFIG["kl_coeff"]):
+    """总损失 = NLL + 动态权重的正则项"""
+    gamma, v, alpha, beta = pred[:, 0], pred[:, 1], pred[:, 2], pred[:, 3]
+    target = target.view(-1)
     
-    def __init__(self, model_save_path: str = "models", scaler_save_path: str = "models"):
-        """
-        初始化训练器
-        
-        Args:
-            model_save_path: 模型保存路径
-            scaler_save_path: 特征缩放器保存路径
-        """
-        self.model_save_path = model_save_path
-        self.scaler_save_path = scaler_save_path
-        self.client_scaler = StandardScaler()
-        self.image_scaler = StandardScaler()
-        self.method_scaler = StandardScaler()
-        
-        # 从配置中获取实验设计参数
-        self.client_profiles = get_client_capabilities()['profiles']
-        self.image_profiles = get_image_profiles()
-        self.algorithms = get_compression_config()['algorithms']
-        
-        # 创建保存目录
-        os.makedirs(model_save_path, exist_ok=True)
-        os.makedirs(scaler_save_path, exist_ok=True)
+    loss_nll = nig_nll_loss(target, gamma, v, alpha, beta)
+    loss_reg = nig_reg_loss(target, gamma, v, alpha, beta)
     
-    def _extract_client_features(self, client_profile: Dict[str, Any]) -> np.ndarray:
-        """
-        提取客户端特征向量
-        
-        Args:
-            client_profile: 客户端画像
-            
-        Returns:
-            客户端特征向量
-        """
-        features = [
-            client_profile.get('cpu_score', 0),
-            client_profile.get('bandwidth_mbps', 0),
-            client_profile.get('decompression_speed', {}).get('gzip', 0),
-            client_profile.get('decompression_speed', {}).get('zstd', 0),
-            client_profile.get('decompression_speed', {}).get('lz4', 0),
-            client_profile.get('network_rtt', 0),
-            client_profile.get('disk_io_speed', 0),
-            client_profile.get('memory_size', 0),
-            client_profile.get('latency_requirement', 0)
-        ]
-        return np.array(features).reshape(1, -1)
+    # 动态调整正则化系数 (Annealing): 前期关注拟合，后期关注不确定性校准
+    annealing_coef = min(1.0, epoch / (total_epochs * 0.15))  # [调整] 15%的训练轮数用于退火
     
-    def _extract_image_features(self, image_profile: Dict[str, Any]) -> np.ndarray:
-        """
-        提取镜像特征向量
-        
-        Args:
-            image_profile: 镜像特征
-            
-        Returns:
-            镜像特征向量
-        """
-        features = [
-            image_profile.get('total_size_mb', 0),
-            image_profile.get('avg_layer_entropy', 0),
-            image_profile.get('text_ratio', 0),
-            image_profile.get('binary_ratio', 0),
-            image_profile.get('layer_count', 0),
-            image_profile.get('file_type_distribution', {}).get('text', 0),
-            image_profile.get('file_type_distribution', {}).get('binary', 0),
-            image_profile.get('file_type_distribution', {}).get('compressed', 0),
-            image_profile.get('avg_file_size', 0),
-            image_profile.get('compression_ratio_estimate', 0)
-        ]
-        return np.array(features).reshape(1, -1)
-    
-    def _encode_method(self, method: str) -> np.ndarray:
-        """
-        对压缩方法进行独热编码
-        
-        Args:
-            method: 压缩方法字符串（如 "gzip-6", "zstd-3", "lz4-fast"）
-            
-        Returns:
-            独热编码向量
-        """
-        # 定义支持的算法类型
-        algorithms = self.algorithms
-        # 获取当前方法在算法列表中的位置
-        try:
-            idx = algorithms.index(method)
-            # 创建独热编码向量
-            encoded = [0] * len(algorithms)
-            encoded[idx] = 1
-        except ValueError:
-            # 如果方法不在列表中，使用默认方法
-            default_method = 'gzip-6'
-            try:
-                idx = algorithms.index(default_method)
-                encoded = [0] * len(algorithms)
-                encoded[idx] = 1
-            except ValueError:
-                # 如果默认方法也不在列表中，使用全零向量
-                encoded = [0] * len(algorithms)
-        
-        return np.array(encoded).reshape(1, -1)
-    
-    def prepare_features(self, training_data: List[Tuple]) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        准备训练特征
-        
-        Args:
-            training_data: 训练数据列表 [(client_profile, image_profile, actual_cost, method), ...]
-            
-        Returns:
-            特征矩阵和目标向量
-        """
-        client_features = []
-        image_features = []
-        method_features = []
-        targets = []
-        
-        for client_profile, image_profile, actual_cost, method in training_data:
-            client_features.append(self._extract_client_features(client_profile)[0])
-            image_features.append(self._extract_image_features(image_profile)[0])
-            method_features.append(self._encode_method(method)[0])
-            targets.append(actual_cost)
-        
-        # 转换为numpy数组
-        client_features = np.vstack(client_features)
-        image_features = np.vstack(image_features)
-        method_features = np.vstack(method_features)
-        targets = np.array(targets)
-        
-        # 标准化特征
-        client_features_scaled = self.client_scaler.fit_transform(client_features)
-        image_features_scaled = self.image_scaler.fit_transform(image_features)
-        method_features_scaled = self.method_scaler.fit_transform(method_features)
-        
-        # 连接所有特征
-        all_features = np.hstack([
-            client_features_scaled,
-            image_features_scaled,
-            method_features_scaled
-        ])
-        
-        return all_features, targets
-    
-    def train_model(self, training_data: List[Tuple], test_size: float = 0.2) -> Dict[str, float]:
-        """
-        训练MLP模型
-        
-        Args:
-            training_data: 训练数据列表
-            test_size: 测试集比例
-            
-        Returns:
-            评估指标字典
-        """
-        print("开始准备训练特征...")
-        features, targets = self.prepare_features(training_data)
-        
-        print(f"特征矩阵形状: {features.shape}")
-        print(f"目标向量形状: {targets.shape}")
-        print(f"训练样本数量: {len(training_data)}")
-        
-        # 分割训练集和测试集
-        X_train, X_test, y_train, y_test = train_test_split(
-            features, targets, test_size=test_size, random_state=42
+    return loss_nll + lambda_coef * annealing_coef * loss_reg
+
+# ==============================================================================
+# 2. 模型定义 (必须与 cags_run.py 保持一致)
+# ==============================================================================
+class FeatureTokenizer(nn.Module):
+    def __init__(self, num_features, embed_dim):
+        super().__init__()
+        self.weights = nn.Parameter(torch.randn(num_features, embed_dim))
+        self.biases = nn.Parameter(torch.randn(num_features, embed_dim))
+        nn.init.xavier_uniform_(self.weights)
+        nn.init.zeros_(self.biases)
+
+    def forward(self, x):
+        return x.unsqueeze(-1) * self.weights + self.biases
+
+class TransformerTower(nn.Module):
+    def __init__(self, num_features, embed_dim, nhead=4, num_layers=2):
+        super().__init__()
+        self.tokenizer = FeatureTokenizer(num_features, embed_dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=nhead, dim_feedforward=embed_dim*4,
+            batch_first=True, dropout=0.1
         )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+    def forward(self, x):
+        tokens = self.tokenizer(x)
+        batch_size = x.shape[0]
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        tokens = torch.cat((cls_tokens, tokens), dim=1)
+        out = self.transformer(tokens)
+        return out[:, 0, :]
+
+class CTSDualTowerModel(nn.Module):
+    def __init__(self, client_feats, image_feats, num_algos, embed_dim=32):
+        super().__init__()
+        self.client_tower = TransformerTower(client_feats, embed_dim)
+        self.image_tower = TransformerTower(image_feats, embed_dim)
+        self.algo_embed = nn.Embedding(num_algos, embed_dim)
         
-        print(f"训练集大小: {X_train.shape[0]}")
-        print(f"测试集大小: {X_test.shape[0]}")
-        
-        # 创建并训练MLP模型
-        print("开始训练MLP模型...")
-        self.model = MLPRegressor(
-            hidden_layer_sizes=(128, 64, 32),
-            activation='relu',
-            solver='adam',
-            max_iter=1000,
-            random_state=42,
-            early_stopping=True,
-            validation_fraction=0.1,
-            n_iter_no_change=10
+        fusion_input_dim = embed_dim * 3 
+        self.hidden = nn.Sequential(
+            nn.Linear(fusion_input_dim, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Dropout(0.2)
         )
-        
-        self.model.fit(X_train, y_train)
-        
-        # 预测和评估
-        y_pred_train = self.model.predict(X_train)
-        y_pred_test = self.model.predict(X_test)
-        
-        # 计算评估指标
-        train_mse = mean_squared_error(y_train, y_pred_train)
-        test_mse = mean_squared_error(y_test, y_pred_test)
-        train_mae = mean_absolute_error(y_train, y_pred_train)
-        test_mae = mean_absolute_error(y_test, y_pred_test)
-        
-        metrics = {
-            'train_mse': train_mse,
-            'test_mse': test_mse,
-            'train_mae': train_mae,
-            'test_mae': test_mae
-        }
-        
-        print("模型训练完成!")
-        print(f"训练集 MSE: {train_mse:.4f}, MAE: {train_mae:.4f}")
-        print(f"测试集 MSE: {test_mse:.4f}, MAE: {test_mae:.4f}")
-        
-        return metrics
-    
-    def save_model(self):
-        """保存训练好的模型和缩放器"""
-        # 保存模型
-        model_path = os.path.join(self.model_save_path, "dual_tower_mlp_model.pkl")
-        with open(model_path, 'wb') as f:
-            pickle.dump(self.model, f)
-        
-        # 保存缩放器
-        client_scaler_path = os.path.join(self.scaler_save_path, "client_scaler.pkl")
-        image_scaler_path = os.path.join(self.scaler_save_path, "image_scaler.pkl")
-        method_scaler_path = os.path.join(self.scaler_save_path, "method_scaler.pkl")
-        
-        with open(client_scaler_path, 'wb') as f:
-            pickle.dump(self.client_scaler, f)
-        
-        with open(image_scaler_path, 'wb') as f:
-            pickle.dump(self.image_scaler, f)
-        
-        with open(method_scaler_path, 'wb') as f:
-            pickle.dump(self.method_scaler, f)
-        
-        print(f"模型已保存至: {model_path}")
-        print(f"缩放器已保存至: {client_scaler_path}, {image_scaler_path}, {method_scaler_path}")
-    
-    def load_training_data_from_feedback(self, feedback_dir: str = "registry") -> List[Tuple]:
-        """
-        从反馈数据中加载训练数据
-        
-        Args:
-            feedback_dir: 反馈数据目录
-            
-        Returns:
-            训练数据列表
-        """
-        training_data = []
-        
-        # 假设反馈数据存储在JSON文件中
-        feedback_file = os.path.join(feedback_dir, "feedback_data.json")
-        
-        if not os.path.exists(feedback_file):
-            print(f"警告: 找不到反馈数据文件 {feedback_file}")
-            return training_data
-        
-        try:
-            with open(feedback_file, 'r', encoding='utf-8') as f:
-                feedback_data = json.load(f)
-            
-            for record in feedback_data:
-                # 提取客户端画像
-                client_profile = {
-                    'cpu_score': record.get('cpu_score', 0),
-                    'bandwidth_mbps': record.get('bandwidth_mbps', 0),
-                    'decompression_speed': record.get('decompression_speed', {}),
-                    'network_rtt': record.get('network_rtt', 0),
-                    'disk_io_speed': record.get('disk_io_speed', 0),
-                    'memory_size': record.get('memory_size', 0),
-                    'latency_requirement': record.get('latency_requirement', 0)
-                }
-                
-                # 提取镜像特征
-                image_profile = {
-                    'total_size_mb': record.get('total_size_mb', 0),
-                    'avg_layer_entropy': record.get('avg_layer_entropy', 0),
-                    'text_ratio': record.get('text_ratio', 0),
-                    'binary_ratio': record.get('binary_ratio', 0),
-                    'layer_count': record.get('layer_count', 0),
-                    'file_type_distribution': record.get('file_type_distribution', {}),
-                    'avg_file_size': record.get('avg_file_size', 0),
-                    'compression_ratio_estimate': record.get('compression_ratio_estimate', 0)
-                }
-                
-                # 计算实际成本
-                actual_cost = (
-                    record.get('actual_compress_time', 0) +
-                    record.get('actual_transfer_time', 0) +
-                    record.get('actual_decomp_time', 0)
-                )
-                
-                # 获取使用的方法
-                method = record.get('algo_used', 'gzip-6')
-                
-                training_data.append((client_profile, image_profile, actual_cost, method))
-        
-        except Exception as e:
-            print(f"加载反馈数据时出错: {e}")
-        
-        return training_data
+        # [修改点] 输出层 4 个神经元 (Gamma, v, Alpha, Beta)
+        self.head = nn.Linear(64, 4) 
 
+    def forward(self, cx, ix, ax):
+        c_vec = self.client_tower(cx)
+        i_vec = self.image_tower(ix)
+        a_vec = self.algo_embed(ax)
+        combined = torch.cat([c_vec, i_vec, a_vec], dim=1)
+        hidden = self.hidden(combined)
+        out = self.head(hidden)
+        
+        # [修改点] 施加数学约束 (Softplus)
+        gamma = out[:, 0]
+        v     = F.softplus(out[:, 1]) + 1e-6
+        alpha = F.softplus(out[:, 2]) + 1.0 + 1e-6
+        beta  = F.softplus(out[:, 3]) + 1e-6
+        
+        return torch.stack([gamma, v, alpha, beta], dim=1)
 
-def main():
-    """主函数，用于训练模型"""
-    print("开始训练决策模型...")
-    
-    # 初始化训练器
-    trainer = ModelTrainer()
-    
-    # 从反馈数据加载训练数据
-    print("从反馈数据中加载训练数据...")
-    training_data = trainer.load_training_data_from_feedback()
-    
-    # 如果没有从反馈中加载到数据，生成一些示例数据
-    if not training_data:
-        print("未找到反馈数据，生成示例训练数据...")
-        training_data = generate_sample_data()
-    
-    print(f"加载到 {len(training_data)} 条训练数据")
-    
-    if len(training_data) == 0:
-        print("没有训练数据，无法训练模型")
-        return
-    
-    # 训练模型
-    metrics = trainer.train_model(training_data)
-    
-    # 保存模型
-    trainer.save_model()
-    
-    print("模型训练完成!")
-    print(f"评估指标: {metrics}")
+# ==============================================================================
+# 3. 数据处理与加载
+# ==============================================================================
+def load_data():
+    print(f"🔄 1. 正在读取数据: {CONFIG['data_path']} ...")
+    try:
+        df_exp = pd.read_excel(CONFIG["data_path"])
+    except ImportError:
+        print("❌ 读取失败！请运行 'pip install openpyxl'")
+        exit(1)
 
+    rename_map = {
+        "image": "image_name", "method": "algo_name",
+        "network_bw": "bandwidth_mbps", "network_delay": "network_rtt",
+        "mem_limit": "mem_limit_mb"
+    }
+    df_exp = df_exp.rename(columns=rename_map)
+    
+    if 'total_time' not in df_exp.columns:
+        possible_cols = [c for c in df_exp.columns if 'total_tim' in c]
+        if possible_cols: df_exp = df_exp.rename(columns={possible_cols[0]: 'total_time'})
 
-def generate_sample_data() -> List[Tuple]:
-    """
-    生成示例训练数据（用于测试）
+    df_exp = df_exp[(df_exp['status'] == 'SUCCESS') & (df_exp['total_time'] > 0)]
     
-    Returns:
-        示例训练数据
-    """
-    sample_data = []
+    if 'mem_limit_mb' not in df_exp.columns: df_exp['mem_limit_mb'] = 1024.0
     
-    # 使用配置中的实验设计参数
-    from ..collection.config import CLIENT_CAPABILITIES, IMAGE_PROFILES, COMPRESSION_CONFIG
+    print(f"🔄 2. 读取镜像特征: {CONFIG['feature_path']} ...")
+    df_feat = pd.read_csv(CONFIG["feature_path"])
     
-    # 生成实验设计中的数据
-    for client_profile in CLIENT_CAPABILITIES['profiles']:
-        for image_profile in IMAGE_PROFILES:
-            for method in COMPRESSION_CONFIG['algorithms']:
-                # 计算一个模拟的实际成本（基于特征的简单函数）
-                actual_cost = (
-                    image_profile['total_size_mb'] / client_profile['decompression_speed']['gzip'] +
-                    image_profile['total_size_mb'] * 8 / client_profile['bandwidth_mbps'] +
-                    np.random.uniform(0.1, 1.0)  # 添加一些随机性
-                )
-                
-                sample_data.append((client_profile, image_profile, actual_cost, method))
-    
-    return sample_data
+    df = pd.merge(df_exp, df_feat, on="image_name", how="inner")
+    print(f"✅ 数据加载完成，样本数: {len(df)}")
+    return df
 
+class CTSDataset(Dataset):
+    def __init__(self, client_x, image_x, algo_x, y):
+        self.cx = torch.FloatTensor(client_x)
+        self.ix = torch.FloatTensor(image_x)
+        self.ax = torch.LongTensor(algo_x)
+        self.y = torch.FloatTensor(y)
+    def __len__(self): return len(self.y)
+    def __getitem__(self, idx): return self.cx[idx], self.ix[idx], self.ax[idx], self.y[idx]
 
+# ==============================================================================
+# 4. 主训练流程 (含 EDL 训练逻辑)
+# ==============================================================================
 if __name__ == "__main__":
-    main()
+    # --- Step 1: 准备数据 ---
+    df = load_data()
+    
+    col_client = ['bandwidth_mbps', 'cpu_limit', 'network_rtt', 'mem_limit_mb']
+    col_image = ['total_size_mb', 'avg_layer_entropy', 'text_ratio', 'layer_count', 'zero_ratio']
+    
+    scaler_c = StandardScaler()
+    X_client = scaler_c.fit_transform(df[col_client].values)
+    
+    scaler_i = StandardScaler()
+    X_image = scaler_i.fit_transform(df[col_image].values)
+    
+    enc_algo = LabelEncoder()
+    X_algo = enc_algo.fit_transform(df['algo_name'].values)
+    
+    y_target = np.log1p(df['total_time'].values) # Log 变换
+
+    Xc_train, Xc_test, Xi_train, Xi_test, Xa_train, Xa_test, y_train, y_test = train_test_split(
+        X_client, X_image, X_algo, y_target, test_size=0.2, random_state=42
+    )
+    
+    train_loader = DataLoader(CTSDataset(Xc_train, Xi_train, Xa_train, y_train), batch_size=CONFIG["batch_size"], shuffle=True)
+    test_loader = DataLoader(CTSDataset(Xc_test, Xi_test, Xa_test, y_test), batch_size=CONFIG["batch_size"])
+    
+    # --- Step 2: 模型初始化 ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🖥️ 训练设备: {device}")
+    
+    model = CTSDualTowerModel(
+        client_feats=len(col_client),
+        image_feats=len(col_image),
+        num_algos=len(enc_algo.classes_)
+    ).to(device)
+    
+    optimizer = optim.Adam(model.parameters(), lr=CONFIG["lr"])
+    
+    # --- Step 3: 训练 (EDL Loop) ---
+    print(f"\n🚀 开始训练 (证据深度学习版 - Uncertainty Aware)...")
+    best_loss = float('inf')
+    
+    for epoch in range(CONFIG["epochs"]):
+        model.train()
+        train_loss = 0
+        
+        for cx, ix, ax, y in train_loader:
+            cx, ix, ax, y = cx.to(device), ix.to(device), ax.to(device), y.to(device)
+            optimizer.zero_grad()
+            
+            # 前向传播 (输出4个参数)
+            preds = model(cx, ix, ax)
+            
+            # 计算 EDL 损失 (NLL + Regularization)
+            loss = evidential_loss(preds, y, epoch, CONFIG["epochs"])
+            
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+            
+        # 验证集 (只看 NLL 即可，验证预测准不准)
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for cx, ix, ax, y in test_loader:
+                cx, ix, ax, y = cx.to(device), ix.to(device), ax.to(device), y.to(device)
+                preds = model(cx, ix, ax)
+                gamma, v, alpha, beta = preds[:, 0], preds[:, 1], preds[:, 2], preds[:, 3]
+                # 验证集不需要正则项，只算 NLL
+                val_loss += nig_nll_loss(y, gamma, v, alpha, beta).item()
+        
+        avg_train = train_loss / len(train_loader)
+        avg_val = val_loss / len(test_loader)
+        
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch+1:03d} | Train Loss: {avg_train:.4f} | Val NLL: {avg_val:.4f}")
+        
+        if avg_val < best_loss:
+            best_loss = avg_val
+            torch.save(model.state_dict(), CONFIG["model_save_path"])
+
+    print(f"\n💾 训练结束！模型保存至: {os.path.abspath(CONFIG['model_save_path'])}")
+    
+    # --- Step 4: 演示 (含不确定性) ---
+    print("\n🔮 预测效果与不确定性演示:")
+    model.load_state_dict(torch.load(CONFIG["model_save_path"]))
+    model.eval()
+    
+    with torch.no_grad():
+        cx, ix, ax, y = next(iter(test_loader))
+        cx, ix, ax, y = cx.to(device), ix.to(device), ax.to(device), y.to(device)
+        
+        # 预测
+        preds = model(cx, ix, ax)
+        gamma, v, alpha, beta = preds[:, 0], preds[:, 1], preds[:, 2], preds[:, 3]
+        
+        print(f"{'算法':<12} | {'预测(s)':<10} | {'不确定性(U)':<12} | {'真实(s)':<10}")
+        print("-" * 60)
+        
+        for i in range(5):
+            pred_s = np.expm1(gamma[i].item())
+            real_s = np.expm1(y[i].item())
+            
+            # 计算不确定性: Aleatoric + Epistemic
+            # Uncertainty = Beta / (v * (Alpha - 1))
+            uncertainty = beta[i] / (v[i] * (alpha[i] - 1))
+            
+            algo = enc_algo.inverse_transform([ax[i].item()])[0]
+            
+            print(f"{algo:<12} | {pred_s:<10.2f} | {uncertainty.item():<12.4f} | {real_s:<10.2f}")
+    
+    print("-" * 60)
+    print("✅ 注意: '不确定性(U)' 越大，代表模型对该预测越没把握 (CAGS 将因此触发风险放大机制)。")
