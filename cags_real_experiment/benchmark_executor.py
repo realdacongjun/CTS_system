@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import time
 import psutil
 import os
+import csv
+from datetime import datetime
 from cts_model import CTSDualTowerModel
 from cags_scheduler import CAGSStrategyLayer, CAGSCorrectionLayer
 from real_sensor import RealSensor
@@ -70,7 +72,7 @@ def load_model(model_path):
             print(f"🔍 找到模型文件: {model_path}")
         
         # 使用安全方式加载模型
-        state_dict = torch.load(model_path, map_location=device, weights_only=False)
+        state_dict = torch.load(model_path, map_location=device, weights_only=True)
         model.load_state_dict(state_dict, strict=False)
         model.eval()
         print("✅ 模型加载成功！")
@@ -89,6 +91,57 @@ def calculate_uncertainty(beta, v, alpha):
     计算不确定性 U = beta / (v * (alpha - 1))
     """
     return beta / (v * (alpha - 1) + 1e-6)  # 防止除零
+
+
+def record_experiment_summary(mode, success, total_time, client_info, predicted_uncertainty=None, chunk_size=None, concurrency=None, output_file=None):
+    """
+    记录实验摘要数据到CSV文件
+    """
+    summary_file = "experiment_summary.csv"
+    file_exists = os.path.isfile(summary_file)
+    
+    with open(summary_file, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        # 写表头
+        if not file_exists:
+            writer.writerow([
+                "Timestamp", "Mode", "BW_Mbps", "RTT_ms", "CPU_Load", "Memory_GB",
+                "Uncertainty", "Init_Chunk_MB", "Concurrency", "Total_Time_s", "Avg_Speed_MB_s", "Success"
+            ])
+        
+        # 提取数据
+        bw = client_info['bandwidth_mbps'] if client_info else 0
+        rtt = client_info['rtt_ms'] if client_info else 0
+        cpu_load = client_info['cpu_load'] if client_info else 0
+        memory_gb = client_info['memory_gb'] if client_info else 0
+        uncert = predicted_uncertainty if predicted_uncertainty is not None else 0
+        init_chunk_mb = chunk_size / (1024*1024) if chunk_size else 0
+        avg_speed = 0
+        
+        # 计算平均速度
+        if output_file and os.path.exists(output_file):
+            try:
+                file_size = os.path.getsize(output_file)
+                avg_speed = (file_size / (1024*1024)) / total_time if total_time > 0 else 0
+            except:
+                avg_speed = 0
+        
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
+            mode,  # Mode
+            f"{bw:.2f}",  # BW_Mbps
+            f"{rtt:.0f}",  # RTT_ms
+            f"{cpu_load:.2f}",  # CPU_Load
+            f"{memory_gb:.1f}",  # Memory_GB
+            f"{uncert:.4f}",  # Uncertainty
+            f"{init_chunk_mb:.2f}",  # Init_Chunk_MB
+            concurrency or 0,  # Concurrency
+            f"{total_time:.2f}",  # Total_Time_s
+            f"{avg_speed:.2f}",  # Avg_Speed_MB_s
+            "TRUE" if success else "FALSE"  # Success
+        ])
+    
+    print(f"[Benchmark] 📝 实验数据已记录至 {summary_file}")
 
 
 def run_cags_mode(args, model, device):
@@ -194,7 +247,26 @@ def run_cags_mode(args, model, device):
     
     # 执行下载
     downloader = RealDownloader(args.url, file_size, args.output_file)
-    success = downloader.download_with_chunks(chunk_size, concurrency, correction)
+    start_time = time.time()
+    success, total_time = downloader.download_with_chunks(chunk_size, concurrency, correction)
+    
+    # 记录实验数据
+    client_info = {
+        'bandwidth_mbps': raw_bw,
+        'rtt_ms': raw_rtt,
+        'cpu_load': real_cpu_load,
+        'memory_gb': raw_mem
+    }
+    record_experiment_summary(
+        mode="CAGS", 
+        success=success, 
+        total_time=total_time, 
+        client_info=client_info,
+        predicted_uncertainty=ai_uncertainty,
+        chunk_size=chunk_size,
+        concurrency=concurrency,
+        output_file=args.output_file
+    )
     
     return success
 
@@ -226,7 +298,25 @@ def run_static_mode(args):
     
     # 执行下载
     downloader = RealDownloader(args.url, file_size, args.output_file)
-    success = downloader.download_with_chunks(chunk_size, concurrency)
+    start_time = time.time()
+    success, total_time = downloader.download_with_chunks(chunk_size, concurrency)
+    
+    # 记录实验数据（使用默认值）
+    client_info = {
+        'bandwidth_mbps': 0,
+        'rtt_ms': 0,
+        'cpu_load': 0,
+        'memory_gb': 0
+    }
+    record_experiment_summary(
+        mode="STATIC", 
+        success=success, 
+        total_time=total_time, 
+        client_info=client_info,
+        chunk_size=chunk_size,
+        concurrency=concurrency,
+        output_file=args.output_file
+    )
     
     return success
 
@@ -261,7 +351,25 @@ def run_aimd_mode(args):
     
     # 执行下载
     downloader = RealDownloader(args.url, file_size, args.output_file)
-    success = downloader.download_with_chunks(chunk_size, concurrency, correction)
+    start_time = time.time()
+    success, total_time = downloader.download_with_chunks(chunk_size, concurrency, correction)
+    
+    # 记录实验数据
+    client_info = {
+        'bandwidth_mbps': 0,
+        'rtt_ms': 0,
+        'cpu_load': 0,
+        'memory_gb': 0
+    }
+    record_experiment_summary(
+        mode="AIMD", 
+        success=success, 
+        total_time=total_time, 
+        client_info=client_info,
+        chunk_size=chunk_size,
+        concurrency=concurrency,
+        output_file=args.output_file
+    )
     
     return success
 

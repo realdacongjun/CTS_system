@@ -66,6 +66,55 @@ def request_server_strategy(server_url, client_info, image_info, server_info):
         return None
 
 
+def record_experiment_summary(success, total_time, client_info, strategy, chunk_size, concurrency, output_file):
+    """
+    记录实验摘要数据到CSV文件
+    """
+    summary_file = "experiment_summary.csv"
+    file_exists = os.path.isfile(summary_file)
+    
+    with open(summary_file, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        # 写表头
+        if not file_exists:
+            writer.writerow([
+                "Timestamp", "Mode", "BW_Mbps", "RTT_ms", "CPU_Load", "Memory_GB",
+                "Uncertainty", "Init_Chunk_MB", "Concurrency", "Total_Time_s", "Avg_Speed_MB_s", "Success"
+            ])
+        
+        # 提取数据
+        bw = client_info['bandwidth_mbps']
+        rtt = client_info['rtt_ms']
+        cpu_load = client_info['cpu_load']
+        memory_gb = client_info['memory_gb']
+        uncert = strategy['meta_info']['uncertainty'] if strategy else 0
+        init_chunk_mb = chunk_size / (1024*1024)
+        
+        # 计算平均速度
+        try:
+            file_size = os.path.getsize(output_file)
+            avg_speed = (file_size / (1024*1024)) / total_time if total_time > 0 else 0
+        except:
+            avg_speed = 0
+        
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
+            "CAGS",  # Mode
+            f"{bw:.2f}",  # BW_Mbps
+            f"{rtt:.0f}",  # RTT_ms
+            f"{cpu_load:.2f}",  # CPU_Load
+            f"{memory_gb:.1f}",  # Memory_GB
+            f"{uncert:.4f}",  # Uncertainty
+            f"{init_chunk_mb:.2f}",  # Init_Chunk_MB
+            concurrency,  # Concurrency
+            f"{total_time:.2f}",  # Total_Time_s
+            f"{avg_speed:.2f}",  # Avg_Speed_MB_s
+            "TRUE" if success else "FALSE"  # Success
+        ])
+    
+    print(f"[Client] 📝 实验数据已记录至 {summary_file}")
+
+
 def main():
     """
     主程序流程：
@@ -75,10 +124,18 @@ def main():
     4. 执行下载
     """
     
+    
     # 配置参数
-    SERVER_URL = "http://192.168.1.100:5000"  # 服务端地址，请根据实际环境修改
-    TARGET_URL = "http://192.168.1.100:80/download.bin"  # 目标下载文件
-    OUTPUT_FILE = "downloaded_file.bin"  # 本地保存路径
+    # ⚠️ 1. 设置服务端的 API 地址 (注意端口 5000)
+    SERVER_URL = "http://47.121.137.243:5000"
+    
+    # ⚠️ 2. 设置 Nginx 下载地址 (注意端口通常是 80，文件名要对)
+    # 假设你的 Nginx 根目录下放的是 real_test.bin
+    TARGET_URL = "http://47.121.137.243/real_test.bin"
+    
+    OUTPUT_FILE = "downloaded_file.bin"
+    
+
     
     # 图像信息（可以根据实际镜像调整）
     IMAGE_INFO = {
@@ -125,18 +182,9 @@ def main():
     chunk_size = strategy['strategy']['initial_chunk_size']
     concurrency = strategy['strategy']['concurrency']
     
-# 第五步：执行下载
-    print("[Client] 开始执行下载...")
-    downloader = RealDownloader(download_url, file_size, OUTPUT_FILE)
+    print(f"[Client] 开始下载: {download_url}")
+    print(f"[Client] 初始策略: 块大小 {chunk_size/(1024*1024):.2f}MB, 并发数 {concurrency}")
     
-    # === 修正开始：在外部计时 ===
-    start_time = time.time() 
-    success = downloader.download_with_chunks(chunk_size, concurrency, correction, micro_log_file)
-    total_time = time.time() - start_time
-    # === 修正结束 ===
-
-    # 记录宏观实验数据
-    summary_file = "experiment_summary.csv"
     # 第三步：获取文件大小
     try:
         response = requests.head(download_url)
@@ -155,57 +203,22 @@ def main():
     # 第四步：初始化AIMD修正层
     correction = CAGSCorrectionLayer(initial_chunk_size=chunk_size)
     
-    # 为微观数据记录创建日志文件
-    micro_log_file = f"micro_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    
     # 第五步：执行下载
     print("[Client] 开始执行下载...")
     downloader = RealDownloader(download_url, file_size, OUTPUT_FILE)
-    success, total_time = downloader.download_with_chunks(chunk_size, concurrency, correction, micro_log_file)
     
-    # 记录宏观实验数据
-    summary_file = "experiment_summary.csv"
-    file_exists = os.path.isfile(summary_file)
+    # 生成微观数据日志文件名
+    micro_log_file = f"microscopic_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     
-    with open(summary_file, 'a', newline='') as f:
-        writer = csv.writer(f)
-        # 写表头
-        if not file_exists:
-            writer.writerow([
-                "Timestamp", "Mode", "RTT_ms", "BW_Mbps", "CPU_Load", 
-                "AI_Uncertainty", "Init_Chunk_MB", "Concurrency", 
-                "Total_Time_s", "Avg_Speed_MBps", "Success"
-            ])
-        
-        # 提取数据
-        bw = client_info['bandwidth_mbps']
-        rtt = client_info['rtt_ms']
-        cpu_load = client_info['cpu_load']
-        uncert = strategy['meta_info']['uncertainty'] if strategy else 0
-        init_chunk_mb = chunk_size / (1024*1024)
-        avg_speed = (file_size / (1024*1024)) / total_time if total_time > 0 else 0
-        
-        writer.writerow([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "CAGS",  # 模式
-            f"{rtt:.0f}",  # RTT
-            f"{bw:.2f}",  # 带宽
-            f"{cpu_load:.3f}",  # CPU负载
-            f"{uncert:.4f}",  # AI不确定性
-            f"{init_chunk_mb:.2f}",  # 初始块大小
-            concurrency,  # 并发数
-            f"{total_time:.2f}",  # 总耗时
-            f"{avg_speed:.2f}",  # 平均速度
-            "TRUE" if success else "FALSE"  # 成功标志
-        ])
-    
-    print(f"[Client] 📝 实验数据已记录至 {summary_file}")
-    print(f"[Client] 📊 微观数据已记录至 {micro_log_file}")
+    success, total_time = downloader.download_with_chunks(chunk_size, concurrency, correction, log_file=micro_log_file)
     
     if success:
         print("[Client] ✅ 下载成功完成!")
     else:
         print("[Client] ❌ 下载过程中出现问题!")
+    
+    # 记录实验摘要数据
+    record_experiment_summary(success, total_time, client_info, strategy, chunk_size, concurrency, OUTPUT_FILE)
 
 
 if __name__ == "__main__":

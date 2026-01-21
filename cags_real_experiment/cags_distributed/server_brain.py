@@ -20,9 +20,9 @@ class SimpleScaler:
 # 这里的均值和方差是基于训练数据估算的
 CLIENT_STATS = {
     'bandwidth_mbps': (20.0, 30.0),    # 平均带宽 20, 波动 30
-    'cpu_load': (0.5, 0.3),           # CPU 负载
+    'cpu_limit': (0.5, 0.3),          # CPU 负载
     'network_rtt': (50.0, 80.0),      # RTT
-    'memory_gb': (8.0, 4.0)           # 内存 (GB)
+    'mem_limit_mb': (8.0, 4.0)        # 内存 (GB)
 }
 IMAGE_STATS = {
     'total_size_mb': (200.0, 150.0), 
@@ -42,7 +42,7 @@ model = CTSDualTowerModel(client_feats=4, image_feats=5, num_algos=10).to(device
 try:
     # 模型路径可能需要根据实际情况调整
     model_path = os.path.join(os.path.dirname(__file__), '..', '..', 'ml_training', 'modeling', 'cts_best_model_full.pth')
-    # 使用安全方式加载模型
+    # 根据PyTorch模型加载安全规范，使用weights_only=True
     state_dict = torch.load(model_path, map_location=device, weights_only=True)
     model.load_state_dict(state_dict, strict=False)
     model.eval()
@@ -83,9 +83,9 @@ def negotiate_strategy():
         raw_mem = client_info.get('memory_gb', 4.0)
         
         norm_bw = scaler.transform(raw_bw, CLIENT_STATS['bandwidth_mbps'][0], CLIENT_STATS['bandwidth_mbps'][1])
-        norm_cpu = scaler.transform(raw_cpu, CLIENT_STATS['cpu_load'][0], CLIENT_STATS['cpu_load'][1])
+        norm_cpu = scaler.transform(raw_cpu, CLIENT_STATS['cpu_limit'][0], CLIENT_STATS['cpu_limit'][1])
         norm_rtt = scaler.transform(raw_rtt, CLIENT_STATS['network_rtt'][0], CLIENT_STATS['network_rtt'][1])
-        norm_mem = scaler.transform(raw_mem, CLIENT_STATS['memory_gb'][0], CLIENT_STATS['memory_gb'][1])
+        norm_mem = scaler.transform(raw_mem, CLIENT_STATS['mem_limit_mb'][0], CLIENT_STATS['mem_limit_mb'][1])
         
         client_vec = torch.FloatTensor([[
             norm_bw, 
@@ -137,7 +137,7 @@ def negotiate_strategy():
         
         # 返回决策结果
         response_data = {
-            'target_url': server_info.get('download_url', 'http://192.168.1.100:80/download'),  # IP占位符，需根据实际环境修改
+            'target_url': server_info.get('download_url', 'http://47.121.137.243/real_test.bin'), 
             'strategy': {
                 'initial_chunk_size': int(chunk_size),
                 'concurrency': int(concurrency)
@@ -155,7 +155,7 @@ def negotiate_strategy():
         print(f"[Server] 决策过程出错: {e}")
         # 返回默认策略
         return jsonify({
-            'target_url': 'http://192.168.1.100:80/download',  # IP占位符，需根据实际环境修改
+            'target_url': 'http://47.121.137.243/real_test.bin',
             'strategy': {
                 'initial_chunk_size': 1024*1024,  # 1MB
                 'concurrency': 2

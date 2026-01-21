@@ -14,11 +14,11 @@ cags_real_experiment/
 ├── cts_model.py              # AI模型定义
 ├── cags_scheduler.py         # CAGS调度算法（战略层+修正层）
 ├── real_sensor.py            # 环境感知模块
-├── real_downloader.py        # 真实下载执行器（支持微观数据记录）
-├── benchmark_executor.py     # 单机版主程序
+├── real_downloader.py        # 真实下载执行器（含数据采集）
+├── benchmark_executor.py     # 单机版主程序（含数据采集）
 ├── cags_distributed/         # 分布式版
 │   ├── server_brain.py       # 服务端AI决策服务
-│   └── smart_client.py       # 客户端主程序（支持宏观数据记录）
+│   └── smart_client.py       # 客户端主程序（含数据采集）
 ├── README.md                 # 本说明文档
 └── PROJECT_OVERVIEW.md       # 详细项目说明文档
 ```
@@ -64,17 +64,17 @@ python smart_client.py
 3. 使用返回的策略执行下载
 4. 在服务端不可达时使用默认策略
 
-## 数据记录功能
+## 数据采集功能
 
-### 微观数据记录（real_downloader.py）
-- 记录每个分片的详细信息
-- CSV格式：[时间戳偏移量, 当前分片大小KB, 瞬时速度MB/s, 状态]
-- 文件名格式：`micro_data_YYYYMMDD_HHMMSS.csv`
+### 微观数据采集
+- **文件**: `microscopic_log_YYYYMMDD_HHMMSS.csv`
+- **内容**: 每个分片的详细信息
+- **字段**: [时间戳, 分片大小(KB), 瞬时速度(MB/s), 状态]
 
-### 宏观数据记录（smart_client.py）
-- 记录实验整体指标
-- CSV格式：[时间戳, 模式, RTT, 带宽, CPU负载, AI不确定性, 初始分片, 并发数, 总耗时, 平均速度, 成功标志]
-- 文件名：`experiment_summary.csv`
+### 宏观数据采集
+- **文件**: `experiment_summary.csv`
+- **内容**: 实验的整体统计数据
+- **字段**: [时间戳, 模式, 带宽, RTT, CPU负载, 内存, 不确定性, 初始分片, 并发数, 总耗时, 平均速度, 成功标志]
 
 ## 核心功能
 
@@ -105,7 +105,7 @@ python smart_client.py
 3. **多线程下载**：基于HTTP Range Requests
 4. **实时反馈**：AIMD机制动态调整策略
 5. **数据完整性**：下载后验证文件大小
-6. **数据记录**：支持微观和宏观数据记录用于后续分析
+6. **数据采集**：详细的微观和宏观数据记录
 
 ## 实验验证
 
