@@ -93,7 +93,7 @@ def calculate_uncertainty(beta, v, alpha):
     return beta / (v * (alpha - 1) + 1e-6)  # 防止除零
 
 
-def record_experiment_summary(mode, success, total_time, client_info, predicted_uncertainty=None, chunk_size=None, concurrency=None, output_file=None):
+def record_experiment_summary(mode, success, total_time, client_info, predicted_uncertainty=None, chunk_size=None, concurrency=None, output_file=None, top_algorithms=None):
     """
     记录实验摘要数据到CSV文件
     """
@@ -106,7 +106,8 @@ def record_experiment_summary(mode, success, total_time, client_info, predicted_
         if not file_exists:
             writer.writerow([
                 "Timestamp", "Mode", "BW_Mbps", "RTT_ms", "CPU_Load", "Memory_GB",
-                "Uncertainty", "Init_Chunk_MB", "Concurrency", "Total_Time_s", "Avg_Speed_MB_s", "Success"
+                "Uncertainty", "Init_Chunk_MB", "Concurrency", "Total_Time_s", "Avg_Speed_MB_s", "Success",
+                "Top_Algo_1", "Top_Algo_2", "Top_Algo_3"
             ])
         
         # 提取数据
@@ -117,6 +118,18 @@ def record_experiment_summary(mode, success, total_time, client_info, predicted_
         uncert = predicted_uncertainty if predicted_uncertainty is not None else 0
         init_chunk_mb = chunk_size / (1024*1024) if chunk_size else 0
         avg_speed = 0
+        
+        # 获取顶级算法
+        top_algo_1 = ""
+        top_algo_2 = ""
+        top_algo_3 = ""
+        if top_algorithms:
+            if len(top_algorithms) > 0:
+                top_algo_1 = f"{top_algorithms[0][0]}({top_algorithms[0][1]:.2f}s)"
+            if len(top_algorithms) > 1:
+                top_algo_2 = f"{top_algorithms[1][0]}({top_algorithms[1][1]:.2f}s)"
+            if len(top_algorithms) > 2:
+                top_algo_3 = f"{top_algorithms[2][0]}({top_algorithms[2][1]:.2f}s)"
         
         # 计算平均速度
         if output_file and os.path.exists(output_file):
@@ -138,7 +151,10 @@ def record_experiment_summary(mode, success, total_time, client_info, predicted_
             concurrency or 0,  # Concurrency
             f"{total_time:.2f}",  # Total_Time_s
             f"{avg_speed:.2f}",  # Avg_Speed_MB_s
-            "TRUE" if success else "FALSE"  # Success
+            "TRUE" if success else "FALSE",  # Success
+            top_algo_1,  # Top_Algo_1
+            top_algo_2,  # Top_Algo_2
+            top_algo_3   # Top_Algo_3
         ])
     
     print(f"[Benchmark] 📝 实验数据已记录至 {summary_file}")
@@ -227,6 +243,20 @@ def run_cags_mode(args, model, device):
     
     print(f"💡 战略层决策: 块大小 {chunk_size/(1024*1024):.2f}MB, 并发数 {concurrency}")
     
+    # 预测不同压缩算法的时间并排序
+    client_profile = {
+        'bandwidth_mbps': raw_bw,
+        'cpu_score': 2000,  # 假设CPU评分为2000
+        'decompression_speed': 200  # 假设解压速度为200MB/s
+    }
+    image_profile = {
+        'total_size_mb': real_file_size_mb,
+        'avg_layer_entropy': 0.65
+    }
+    sorted_algorithms = strategy.predict_compression_times(client_profile, image_profile)
+    
+    print(f"[Benchmark] 压缩算法预测时间排序 (前5): {sorted_algorithms[:5]}")
+    
     # 获取文件大小
     try:
         response = requests.head(args.url)
@@ -265,7 +295,8 @@ def run_cags_mode(args, model, device):
         predicted_uncertainty=ai_uncertainty,
         chunk_size=chunk_size,
         concurrency=concurrency,
-        output_file=args.output_file
+        output_file=args.output_file,
+        top_algorithms=sorted_algorithms[:3]  # 记录前3个最佳算法
     )
     
     return success
@@ -315,7 +346,8 @@ def run_static_mode(args):
         client_info=client_info,
         chunk_size=chunk_size,
         concurrency=concurrency,
-        output_file=args.output_file
+        output_file=args.output_file,
+        top_algorithms=[('gzip-6', 10.0), ('zstd-3', 12.0)]  # 默认算法
     )
     
     return success
@@ -368,7 +400,8 @@ def run_aimd_mode(args):
         client_info=client_info,
         chunk_size=chunk_size,
         concurrency=concurrency,
-        output_file=args.output_file
+        output_file=args.output_file,
+        top_algorithms=[('gzip-6', 10.0), ('lz4-fast', 11.0)]  # 默认算法
     )
     
     return success

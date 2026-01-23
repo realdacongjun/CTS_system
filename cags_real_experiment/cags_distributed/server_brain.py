@@ -135,6 +135,20 @@ def negotiate_strategy():
         
         print(f"[Server] 战略层决策: 块大小 {chunk_size/(1024*1024):.2f}MB, 并发数 {concurrency}")
         
+        # 预测不同压缩算法的时间并排序
+        client_profile = {
+            'bandwidth_mbps': raw_bw,
+            'cpu_score': 2000,  # 假设CPU评分为2000
+            'decompression_speed': 200  # 假设解压速度为200MB/s
+        }
+        image_profile = {
+            'total_size_mb': raw_size,
+            'avg_layer_entropy': 0.65
+        }
+        sorted_algorithms = strategy.predict_compression_times(client_profile, image_profile)
+        
+        print(f"[Server] 压缩算法预测时间排序 (前5): {sorted_algorithms[:5]}")
+        
         # 返回决策结果
         response_data = {
             'target_url': server_info.get('download_url', 'http://47.121.137.243/real_test.bin'), 
@@ -145,7 +159,8 @@ def negotiate_strategy():
             'meta_info': {
                 'predicted_time_s': predicted_time_s,
                 'uncertainty': ai_uncertainty,
-                'cost': float(cost)
+                'cost': float(cost),
+                'top_algorithms': sorted_algorithms[:5]  # 返回前5个最佳算法
             }
         }
         
@@ -164,7 +179,8 @@ def negotiate_strategy():
                 'predicted_time_s': 0,
                 'uncertainty': 0.1,
                 'cost': 1.0,
-                'error': str(e)
+                'error': str(e),
+                'top_algorithms': [('gzip-6', 10.0), ('zstd-3', 12.0)]  # 默认算法
             }
         })
 

@@ -56,6 +56,13 @@ def request_server_strategy(server_url, client_info, image_info, server_info):
         if response.status_code == 200:
             strategy = response.json()
             print(f"[Client] 服务端AI决策完成: {strategy['strategy']}")
+            
+            # 显示压缩算法预测时间排序
+            if 'top_algorithms' in strategy['meta_info']:
+                print("[Client] 压缩算法预测时间排序 (前5):")
+                for i, (algo, time_pred) in enumerate(strategy['meta_info']['top_algorithms']):
+                    print(f"  {i+1}. {algo}: {time_pred:.2f}s")
+            
             return strategy
         else:
             print(f"[Client] 服务端API调用失败: {response.status_code}")
@@ -79,7 +86,8 @@ def record_experiment_summary(success, total_time, client_info, strategy, chunk_
         if not file_exists:
             writer.writerow([
                 "Timestamp", "Mode", "BW_Mbps", "RTT_ms", "CPU_Load", "Memory_GB",
-                "Uncertainty", "Init_Chunk_MB", "Concurrency", "Total_Time_s", "Avg_Speed_MB_s", "Success"
+                "Uncertainty", "Init_Chunk_MB", "Concurrency", "Total_Time_s", "Avg_Speed_MB_s", "Success",
+                "Top_Algo_1", "Top_Algo_2", "Top_Algo_3"
             ])
         
         # 提取数据
@@ -89,6 +97,19 @@ def record_experiment_summary(success, total_time, client_info, strategy, chunk_
         memory_gb = client_info['memory_gb']
         uncert = strategy['meta_info']['uncertainty'] if strategy else 0
         init_chunk_mb = chunk_size / (1024*1024)
+        
+        # 获取顶级算法
+        top_algo_1 = ""
+        top_algo_2 = ""
+        top_algo_3 = ""
+        if strategy and 'top_algorithms' in strategy['meta_info']:
+            algos = strategy['meta_info']['top_algorithms']
+            if len(algos) > 0:
+                top_algo_1 = f"{algos[0][0]}({algos[0][1]:.2f}s)"
+            if len(algos) > 1:
+                top_algo_2 = f"{algos[1][0]}({algos[1][1]:.2f}s)"
+            if len(algos) > 2:
+                top_algo_3 = f"{algos[2][0]}({algos[2][1]:.2f}s)"
         
         # 计算平均速度
         try:
@@ -109,7 +130,10 @@ def record_experiment_summary(success, total_time, client_info, strategy, chunk_
             concurrency,  # Concurrency
             f"{total_time:.2f}",  # Total_Time_s
             f"{avg_speed:.2f}",  # Avg_Speed_MB_s
-            "TRUE" if success else "FALSE"  # Success
+            "TRUE" if success else "FALSE",  # Success
+            top_algo_1,  # Top_Algo_1
+            top_algo_2,  # Top_Algo_2
+            top_algo_3   # Top_Algo_3
         ])
     
     print(f"[Client] 📝 实验数据已记录至 {summary_file}")
@@ -124,18 +148,10 @@ def main():
     4. 执行下载
     """
     
-    
     # 配置参数
-    # ⚠️ 1. 设置服务端的 API 地址 (注意端口 5000)
-    SERVER_URL = "http://47.121.137.243:5000"
-    
-    # ⚠️ 2. 设置 Nginx 下载地址 (注意端口通常是 80，文件名要对)
-    # 假设你的 Nginx 根目录下放的是 real_test.bin
-    TARGET_URL = "http://47.121.137.243/real_test.bin"
-    
-    OUTPUT_FILE = "downloaded_file.bin"
-    
-
+    SERVER_URL = "http://192.168.1.100:5000"  # 服务端地址，请根据实际环境修改
+    TARGET_URL = "http://47.121.137.243/real_test.bin"  # 目标下载文件
+    OUTPUT_FILE = "downloaded_file.bin"  # 本地保存路径
     
     # 图像信息（可以根据实际镜像调整）
     IMAGE_INFO = {
@@ -173,7 +189,8 @@ def main():
             'meta_info': {
                 'predicted_time_s': 0,
                 'uncertainty': 0.1,
-                'cost': 1.0
+                'cost': 1.0,
+                'top_algorithms': [('gzip-6', 10.0), ('zstd-3', 12.0)]
             }
         }
     

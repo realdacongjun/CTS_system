@@ -20,6 +20,7 @@ CAGS（Context-aware Granularity Scaling）是一个基于AI和不确定性感�
 - 支持单机版和分布式版两种部署模式
 - 服务端负责AI决策，客户端负责执行
 - 实现完整的"感知→决策→执行→反馈"闭环
+- 增加压缩算法预测和排序功能
 
 ## 项目文件结构
 
@@ -27,15 +28,15 @@ CAGS（Context-aware Granularity Scaling）是一个基于AI和不确定性感�
 cags_real_experiment/
 ├── cts_model.py              # AI模型定义（双塔EDL模型，4输出: Gamma,v,Alpha,Beta）
 ├── cags_scheduler.py         # CAGS调度算法
-│   ├── CAGSStrategyLayer     # 战略层：基于势垒函数的非凸优化
+│   ├── CAGSStrategyLayer     # 战略层：基于势垒函数的非凸优化 + 压缩算法预测
 │   ├── CAGSTacticalLayer     # 战术层：P-C流水线与乱序重排机制
 │   └── CAGSCorrectionLayer   # 修正层：AIMD算法进行动态反馈控制
 ├── real_sensor.py            # 环境感知模块（参考probe设计）
 ├── real_downloader.py        # 基于Range请求的真实下载器
 ├── benchmark_executor.py     # 单机版主程序（支持cags/static/aimd三种模式）
 ├── cags_distributed/         # 分布式版组件
-│   ├── server_brain.py       # 服务端AI决策服务（Flask API）
-│   └── smart_client.py       # 客户端主程序
+│   ├── server_brain.py       # 服务端AI决策服务（Flask API + 压缩算法预测）
+│   └── smart_client.py       # 客户端主程序（显示压缩算法排序）
 ├── README.md                 # 项目说明文档
 └── PROJECT_OVERVIEW.md       # 本详细说明文档
 ```
@@ -55,6 +56,7 @@ cags_real_experiment/
   - 考虑传输时间、CPU开销、传输风险
   - 支持不确定性感知的风险放大机制
   - 并发增益使用边际收益递减模型(n^0.9)
+  - **新增**: `predict_compression_times()` 方法，预测不同压缩算法的总时间并排序
 
 - **CAGSCorrectionLayer**: 修正层，实现AIMD算法
   - 成功路径：加性增加块大小(+256KB)
@@ -74,6 +76,7 @@ cags_real_experiment/
   - 实现文件预分配防止碎片
   - 支持进度跟踪和速度计算
   - 集成AIMD反馈机制
+  - **新增**: 微观数据采集功能，记录每个分片的时间戳、大小、速度和状态
 
 ### 5. benchmark_executor.py - 单机版主程序
 - 支持三种运行模式：
@@ -82,18 +85,39 @@ cags_real_experiment/
   - `aimd`: AIMD策略（固定初始配置，动态调整）
 - 实现特征标准化以匹配训练分布
 - 集成系统资源监控
+- **新增**: 压缩算法预测功能，显示不同算法的预测时间排序
 
 ### 6. cags_distributed/server_brain.py - 服务端
 - Flask API服务，提供/negotiate端点
 - 加载AI模型进行策略计算
 - 实现特征标准化处理
 - 返回最优分片大小和并发数
+- **新增**: 集成压缩算法预测功能，返回前5个最佳算法及其预测时间
 
 ### 7. cags_distributed/smart_client.py - 客户端
 - 感知本地环境
 - 向服务端请求AI决策
 - 使用返回策略执行下载
 - 服务端不可达时使用fallback策略
+- **新增**: 显示压缩算法预测时间排序结果，记录到实验数据中
+
+## 压缩算法预测功能详解
+
+### 核心逻辑
+- **预测对象**: gzip-1~9, zstd-1~19, lz4-fast/medium/slow, brotli-1~11
+- **计算公式**: 总时间 = 压缩时间 + 传输时间 + 解压时间
+- **排序依据**: 按总时间升序排列，推荐时间最短的算法
+
+### 时间计算方法
+1. **压缩时间**: 根据算法类型、压缩等级、文件大小、CPU性能、数据熵值计算
+2. **传输时间**: 压缩后大小 / 带宽
+3. **解压时间**: 根据解压速度和压缩后大小计算
+
+### 实现细节
+- **CAGSStrategyLayer.predict_compression_times()**: 主要预测函数
+- **_calculate_compression_time()**: 计算特定算法的总时间
+- **_get_compression_time()**: 估算压缩时间
+- **_get_compression_ratio()**: 估算压缩比
 
 ## AI模型集成细节
 
@@ -134,7 +158,7 @@ python server_brain.py
 ```
 - 运行在`http://192.168.1.100:5000`
 - 负责AI模型推理和策略计算
-- 接收客户端环境信息，返回最优配置
+- 接收客户端环境信息，返回最优配置和压缩算法推荐
 
 #### 客户端（2C2G终端设备）
 ```bash
@@ -143,7 +167,20 @@ python smart_client.py
 ```
 - 感知本地环境并上报
 - 接收服务端策略指导
+- 显示压缩算法预测时间排序
 - 执行分片下载任务
+
+## 数据采集功能
+
+### 微观数据采集
+- **文件**: `microscopic_log_YYYYMMDD_HHMMSS.csv`
+- **内容**: 每个分片的详细信息
+- **字段**: [时间戳, 分片大小(KB), 瞬时速度(MB/s), 状态]
+
+### 宏观数据采集
+- **文件**: `experiment_summary.csv`
+- **内容**: 实验的整体统计数据
+- **字段**: [时间戳, 模式, 带宽, RTT, CPU负载, 内存, 不确定性, 初始分片, 并发数, 总耗时, 平均速度, 成功标志, 顶级算法1-3]
 
 ## 关键算法实现
 
@@ -200,7 +237,12 @@ def feedback(self, status, rtt_ms=None):
 - 容忍短期网络波动
 - 避免过度反应
 
-### 4. 特征标准化
+### 4. 压缩算法预测与排序
+- 预测多种压缩算法的总时间
+- 按时间升序排序
+- 推荐最优算法
+
+### 5. 特征标准化
 - 确保推理输入与训练分布一致
 - 防止模型输出饱和
 - 保证决策准确性
@@ -208,7 +250,7 @@ def feedback(self, status, rtt_ms=None):
 ## 实验验证方案
 
 ### 1. 对比实验设计
-- **CAGS模式**: AI+不确定性感知+AIMD
+- **CAGS模式**: AI+不确定性感知+AIMD+压缩算法优化
 - **Static模式**: 固定配置（模拟Docker）
 - **AIMD模式**: 动态调整但无AI决策
 
@@ -217,6 +259,7 @@ def feedback(self, status, rtt_ms=None):
 - 传输成功率
 - 瞬时速度稳定性
 - RTO重传次数
+- 压缩算法效率
 
 ### 3. 测试环境
 - 弱网模拟（Clumsy/TC工具）
@@ -231,6 +274,8 @@ def feedback(self, status, rtt_ms=None):
 - ✓ 端云协同架构设计
 - ✓ 不确定性感知机制
 - ✓ 完整闭环反馈系统
+- ✓ 压缩算法预测与排序功能
+- ✓ 详细数据采集功能
 
 ### 可进一步优化
 - 网络状态实时监控与反馈
@@ -242,3 +287,4 @@ def feedback(self, status, rtt_ms=None):
 - 验证了AI驱动的自适应传输策略在真实环境中的有效性
 - 为容器镜像传输优化提供了新的解决方案
 - 体现了边缘计算场景下的智能调度思想
+- 集成了压缩算法预测与网络传输优化的综合方案
