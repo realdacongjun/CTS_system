@@ -1,12 +1,14 @@
 import requests
 import time
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import threading
 import csv
 
-
 class RealDownloader:
+    """
+    真实环境并发下载器 (防崩溃最终版)
+    """
     def __init__(self, url, file_size, output_path):
         self.url = url
         self.total_size = file_size
@@ -15,144 +17,91 @@ class RealDownloader:
         self.progress_lock = threading.Lock()
         self.downloaded_bytes = 0
         
-        # 初始化空文件
-        with open(self.output_path, 'wb') as f:
-            f.seek(self.total_size - 1)
-            f.write(b'\0')
+        # 预分配磁盘空间
+        print(f"[Downloader] 正在预分配磁盘空间: {file_size/(1024*1024):.2f} MB")
+        try:
+            with open(self.output_path, 'wb') as f:
+                f.seek(self.total_size - 1)
+                f.write(b'\0')
+        except Exception as e:
+            print(f"[Downloader] ⚠️ 预分配空间失败: {e}")
 
     def _fetch_chunk(self, start, end, chunk_id, log_file):
-        """下载单个分片的工作函数"""
         headers = {'Range': f'bytes={start}-{end}'}
         try:
             t0 = time.time()
-            resp = requests.get(self.url, headers=headers, timeout=10)
+            # timeout=15 适应极慢的弱网环境 (1.5s RTT)
+            resp = requests.get(self.url, headers=headers, timeout=15)
             
             if resp.status_code == 206:
                 data = resp.content
                 duration = time.time() - t0
-                
-                # 写入文件 (加锁防止冲突)
                 with self.lock:
                     with open(self.output_path, 'r+b') as f:
                         f.seek(start)
                         f.write(data)
-                
-                # 更新下载进度
                 with self.progress_lock:
                     self.downloaded_bytes += len(data)
-                
-                # 记录微观数据
-                with open(log_file, 'a', newline='') as csvfile:
-                    writer = csv.writer(csvfile)
-                    inst_speed = (len(data)/1024/1024) / duration if duration > 0 else 0
-                    writer.writerow([
-                        time.time(),  # 时间戳
-                        len(data)/1024,  # 当前分片大小KB
-                        f"{inst_speed:.2f}",  # 瞬时速度MB/s
-                        'SUCCESS'  # 状态
-                    ])
-                
+                self._log_micro_data(log_file, time.time(), len(data), duration, 'SUCCESS')
                 return len(data), duration, 'SUCCESS'
             else:
-                # 记录失败情况
-                with open(log_file, 'a', newline='') as csvfile:
-                    writer = csv.writer(csvfile)
-                    writer.writerow([
-                        time.time(),  # 时间戳
-                        (end-start+1)/1024,  # 分片大小KB
-                        0,  # 瞬时速度
-                        'FAILED'  # 状态
-                    ])
                 return 0, 0, 'FAILED'
-        except Exception as e:
-            # 记录超时情况
-            with open(log_file, 'a', newline='') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow([
-                    time.time(),  # 时间戳
-                    (end-start+1)/1024,  # 分片大小KB
-                    0,  # 瞬时速度
-                    'TIMEOUT'  # 状态
-                ])
+        except:
+            # 任何错误都只记录，不抛出异常
+            self._log_micro_data(log_file, time.time(), (end-start+1), 0, 'TIMEOUT')
             return 0, 0, 'TIMEOUT'
 
+    def _log_micro_data(self, log_file, ts, size, duration, status):
+        try:
+            with open(log_file, 'a', newline='') as csvfile:
+                inst_speed = (size/1024/1024) / duration if duration > 0 else 0
+                csv.writer(csvfile).writerow([ts, size/1024, f"{inst_speed:.2f}", status])
+        except:
+            pass
+
     def download_with_chunks(self, initial_chunk_size, concurrency, correction_layer=None, log_file='microscopic_log.csv'):
-        """
-        执行分片下载
-        :param correction_layer: 传入 CAGSCorrectionLayer 实例，如果为 None 则不调整
-        :param log_file: 微观数据记录文件路径
-        """
         cursor = 0
         self.downloaded_bytes = 0
         start_time = time.time()
         
-        # 初始化日志文件
         with open(log_file, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Timestamp', 'Chunk_Size_KB', 'Speed_MB_s', 'Status'])  # 写表头
+            csv.writer(f).writerow(['Timestamp', 'Chunk_Size_KB', 'Speed_MB_s', 'Status'])
 
-        # 初始化决策日志列表
-        log_data = []
-
-        print(f"📥 开始下载 | 大小: {self.total_size/(1024*1024):.2f}MB | 并发: {concurrency} | 初始块: {initial_chunk_size/(1024*1024):.2f}MB")
+        print(f"📥 开始下载 | 目标: {self.total_size/(1024*1024):.2f}MB | 并发: {concurrency}")
 
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = {}
-            active_count = 0
-            
             while cursor < self.total_size or futures:
-                # 1. 提交新任务 (如果还有剩余数据且并发未满)
+                # 1. 提交任务
                 while cursor < self.total_size and len(futures) < concurrency:
-                    # 动态获取当前切片大小
-                    if correction_layer:
-                        current_chunk_size = correction_layer.current_size
-                    else:
-                        current_chunk_size = initial_chunk_size # 静态模式
-                    
+                    current_chunk_size = correction_layer.current_size if correction_layer else initial_chunk_size
                     end = min(cursor + current_chunk_size - 1, self.total_size - 1)
-                    
-                    # 提交
                     future = executor.submit(self._fetch_chunk, cursor, end, 0, log_file)
                     futures[future] = (cursor, end)
                     cursor += current_chunk_size
                 
-                # 2. 处理已完成的任务
-                completed_futures = []
-                for future in as_completed(list(futures.keys()), timeout=0.1):
-                    size, duration, status = future.result()
-                    start_pos, end_pos = futures[future]
-                    completed_futures.append(future)
-                    
-                    if status == 'SUCCESS':
-                        # 打印进度 (每 5MB 打印一次，避免刷屏)
-                        with self.progress_lock:
-                            progress = self.downloaded_bytes / self.total_size * 100
-                        speed = (size/1024/1024) / duration if duration > 0 else 0
-                        if self.downloaded_bytes % (5*1024*1024) < size:
-                            print(f"\r🚀 进度: {progress:.1f}% | 瞬时速度: {speed:.2f} MB/s | 块: {size/1024:.0f}KB", end="")
-
-                    # 3. 反馈给 AIMD 修正层
-                    if correction_layer:
-                        correction_layer.feedback(status, rtt_ms=duration*1000)
+                # 2. 【核心修复】轮询状态 (去掉会导致崩溃的 as_completed)
+                done_list = []
+                for f in list(futures.keys()):
+                    if f.done():
+                        done_list.append(f)
+                        try:
+                            size, duration, status = f.result()
+                            if status == 'SUCCESS':
+                                progress = self.downloaded_bytes / self.total_size * 100
+                                speed = (size/1024/1024) / duration if duration > 0 else 0
+                                # 强制刷新显示
+                                print(f"\r🚀 进度: {progress:.1f}% | 速度: {speed:.2f} MB/s ", end="", flush=True)
+                            if correction_layer:
+                                correction_layer.feedback(status, duration*1000)
+                        except:
+                            pass
                 
-                # 移除已完成的任务
-                for future in completed_futures:
-                    del futures[future]
+                for f in done_list:
+                    del futures[f]
                 
-                # 避免 CPU 空转
-                time.sleep(0.01)
+                time.sleep(0.05) # 稍微等待，防止CPU空转
 
         total_time = time.time() - start_time
-        avg_speed = (self.total_size / (1024*1024)) / total_time
-        print(f"\n✅ 下载完成 | 耗时: {total_time:.2f}s | 平均速度: {avg_speed:.2f} MB/s")
-        
-        # 验证文件大小
-        actual_size = os.path.getsize(self.output_path)
-        success = actual_size == self.total_size
-                
-        if success:
-            print("✅ 文件完整性验证通过!")
-        else:
-            print(f"❌ 文件完整性验证失败! 期望: {self.total_size}, 实际: {actual_size}")
-                
-        return success, total_time
+        print(f"\n✅ 下载流程结束 | 耗时: {total_time:.2f}s")
+        return os.path.getsize(self.output_path) == self.total_size, total_time
