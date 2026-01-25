@@ -15,19 +15,23 @@ from cags_scheduler import CAGSCorrectionLayer
 
 def get_client_environment(target_url):
     """
-    获取客户端环境信息
+    获取客户端环境信息 (已增强鲁棒性)
     """
     print("[Client] 正在感知本地环境...")
     sensor = RealSensor(target_url)
     profile = sensor.get_full_client_profile()
     
-    # 构造客户端信息
+    # [关键修复] 使用 .get() 安全获取嵌套字典，防止 Sensor 探测失败导致 Key 丢失
+    net_profile = profile.get('network_profile', {})
+    sys_info = profile.get('system_info', {})
+
+    # [关键修复] 构造客户端信息，提供保守默认值
     client_info = {
-        'bandwidth_mbps': profile['network_profile']['bandwidth_mbps'],
-        'rtt_ms': profile['network_profile']['rtt_ms'],
-        'cpu_load': profile['current_cpu_load'],
-        'memory_gb': profile['system_info']['total_memory_gb'],
-        'connection_stability': profile['network_profile']['connection_stability']
+        'bandwidth_mbps': net_profile.get('bandwidth_mbps', 10.0), # 默认 10M
+        'rtt_ms': net_profile.get('rtt_ms', 100.0),                # 默认 100ms
+        'cpu_load': profile.get('current_cpu_load', 0.5),          # 默认 50%
+        'memory_gb': sys_info.get('total_memory_gb', 2.0),         # 默认 2G
+        'connection_stability': net_profile.get('connection_stability', 1.0)
     }
     
     print(f"[Client] 环境感知完成: {client_info}")
@@ -58,7 +62,7 @@ def request_server_strategy(server_url, client_info, image_info, server_info):
             print(f"[Client] 服务端AI决策完成: {strategy['strategy']}")
             
             # 显示压缩算法预测时间排序
-            if 'top_algorithms' in strategy['meta_info']:
+            if 'meta_info' in strategy and 'top_algorithms' in strategy['meta_info']:
                 print("[Client] 压缩算法预测时间排序 (前5):")
                 for i, (algo, time_pred) in enumerate(strategy['meta_info']['top_algorithms']):
                     print(f"  {i+1}. {algo}: {time_pred:.2f}s")
@@ -90,19 +94,23 @@ def record_experiment_summary(success, total_time, client_info, strategy, chunk_
                 "Top_Algo_1", "Top_Algo_2", "Top_Algo_3"
             ])
         
-        # 提取数据
-        bw = client_info['bandwidth_mbps']
-        rtt = client_info['rtt_ms']
-        cpu_load = client_info['cpu_load']
-        memory_gb = client_info['memory_gb']
-        uncert = strategy['meta_info']['uncertainty'] if strategy else 0
+        # 提取数据 (使用 .get 安全提取)
+        bw = client_info.get('bandwidth_mbps', 0)
+        rtt = client_info.get('rtt_ms', 0)
+        cpu_load = client_info.get('cpu_load', 0)
+        memory_gb = client_info.get('memory_gb', 0)
+        
+        uncert = 0
+        if strategy and 'meta_info' in strategy:
+             uncert = strategy['meta_info'].get('uncertainty', 0)
+
         init_chunk_mb = chunk_size / (1024*1024)
         
         # 获取顶级算法
         top_algo_1 = ""
         top_algo_2 = ""
         top_algo_3 = ""
-        if strategy and 'top_algorithms' in strategy['meta_info']:
+        if strategy and 'meta_info' in strategy and 'top_algorithms' in strategy['meta_info']:
             algos = strategy['meta_info']['top_algorithms']
             if len(algos) > 0:
                 top_algo_1 = f"{algos[0][0]}({algos[0][1]:.2f}s)"
@@ -141,19 +149,15 @@ def record_experiment_summary(success, total_time, client_info, strategy, chunk_
 
 def main():
     """
-    主程序流程：
-    1. 感知本地环境
-    2. 向服务端请求AI决策
-    3. 初始化AIMD修正层
-    4. 执行下载
+    主程序流程
     """
+    # [修改点1] 配置参数：允许通过环境变量或命令行参数配置IP
+    server_ip = os.getenv('SERVER_IP', '47.121.137.243')  # 可通过环境变量配置
+    SERVER_URL = f"http://{server_ip}:5000" 
+    TARGET_URL = f"http://{server_ip}/real_test.bin" 
+    OUTPUT_FILE = "downloaded_file.bin" 
     
-    # 配置参数
-    SERVER_URL = "http://192.168.1.100:5000"  # 服务端地址，请根据实际环境修改
-    TARGET_URL = "http://47.121.137.243/real_test.bin"  # 目标下载文件
-    OUTPUT_FILE = "downloaded_file.bin"  # 本地保存路径
-    
-    # 图像信息（可以根据实际镜像调整）
+    # 图像信息
     IMAGE_INFO = {
         'size_mb': 1024.0,  # 1GB镜像
         'avg_layer_entropy': 0.7,
@@ -162,7 +166,6 @@ def main():
         'zero_ratio': 0.1
     }
     
-    # 服务端信息
     SERVER_INFO = {
         'download_url': TARGET_URL
     }
@@ -204,17 +207,23 @@ def main():
     
     # 第三步：获取文件大小
     try:
-        response = requests.head(download_url)
+        # [修改点2] 增加 timeout 防止弱网卡死
+        response = requests.head(download_url, timeout=10)
         file_size = int(response.headers.get('Content-Length', 0))
         if file_size == 0:
             print("[Client] ⚠️  无法获取文件大小，尝试使用Range请求获取")
-            response = requests.get(download_url, headers={'Range': 'bytes=0-0'}, timeout=5)
+            response = requests.get(download_url, headers={'Range': 'bytes=0-0'}, timeout=10)
             if response.status_code == 206:
                 content_range = response.headers.get('Content-Range', '')
                 if content_range:
                     file_size = int(content_range.split('/')[-1])
-    except:
-        print("[Client] ⚠️  获取文件大小失败，默认使用1GB")
+    except requests.exceptions.RequestException as e:
+        print(f"[Client] ⚠️  网络请求失败: {e}")
+        print("[Client] ⚠️  使用默认文件大小 1GB")
+        file_size = 1024 * 1024 * 1024  # 1GB
+    except Exception as e:
+        print(f"[Client] ⚠️  获取文件大小异常: {e}")
+        print("[Client] ⚠️  使用默认文件大小 1GB")
         file_size = 1024 * 1024 * 1024  # 1GB
     
     # 第四步：初始化AIMD修正层

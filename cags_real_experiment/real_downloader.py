@@ -91,6 +91,9 @@ class RealDownloader:
             writer = csv.writer(f)
             writer.writerow(['Timestamp', 'Chunk_Size_KB', 'Speed_MB_s', 'Status'])  # 写表头
 
+        # 初始化决策日志列表
+        log_data = []
+
         print(f"📥 开始下载 | 大小: {self.total_size/(1024*1024):.2f}MB | 并发: {concurrency} | 初始块: {initial_chunk_size/(1024*1024):.2f}MB")
 
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
@@ -107,9 +110,6 @@ class RealDownloader:
                         current_chunk_size = initial_chunk_size # 静态模式
                     
                     end = min(cursor + current_chunk_size - 1, self.total_size - 1)
-                    
-                    # 记录决策日志
-                    log_data.append((time.time()-start_time, current_chunk_size))
                     
                     # 提交
                     future = executor.submit(self._fetch_chunk, cursor, end, 0, log_file)
@@ -148,9 +148,11 @@ class RealDownloader:
         
         # 验证文件大小
         actual_size = os.path.getsize(self.output_path)
-        if actual_size == self.total_size:
+        success = actual_size == self.total_size
+                
+        if success:
             print("✅ 文件完整性验证通过!")
-            return True
         else:
             print(f"❌ 文件完整性验证失败! 期望: {self.total_size}, 实际: {actual_size}")
-            return False
+                
+        return success, total_time
