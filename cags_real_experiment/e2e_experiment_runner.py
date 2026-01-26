@@ -168,7 +168,7 @@ class CTSClient:
 
 def run_experiment():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--ip', type=str, default='47.121.137.243', help='Server IP')
+    parser.add_argument('--ip', type=str, default='47.121.127.59', help='Server IP')
     args = parser.parse_args()
     
     net_ctrl = NetworkController()
