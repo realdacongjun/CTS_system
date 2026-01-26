@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-e2e_experiment_runner.py - 客户端端到端性能对比实验 (含 Zstd 支持)
+e2e_runner_thesis.py - 毕业设计专用：全矩阵 + 3次重复 + 统计分析
 """
 
 import argparse
@@ -9,263 +9,199 @@ import subprocess
 import time
 import csv
 import os
+import statistics  # 用于计算平均值和标准差
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
 from datetime import datetime
 
+# =================配置区域=================
+# 重复次数：学术实验通常建议 3次 或 5次
+REPEAT_COUNT = 3 
+
+# 四大测试镜像
+TEST_IMAGES = [
+    {'name': 'Perl (Text)',    'file': 'generalized_text.tar'},
+    {'name': 'HAProxy (Mix)',  'file': 'generalized_mixed.tar'},
+    {'name': 'Redis (Bin)',    'file': 'generalized_binary.tar'},
+    {'name': 'Alpine (OS)',    'file': 'generalized_os.tar'}
+]
+
+# 三大网络场景
+SCENARIOS = [
+    {'name': 'A-IoT',   'bw': 2,   'delay': 400, 'loss': 5, 'strategy': 'weak'},
+    {'name': 'B-Edge',  'bw': 20,  'delay': 50,  'loss': 1, 'strategy': 'balanced'},
+    {'name': 'C-Cloud', 'bw': 100, 'delay': 20,  'loss': 0, 'strategy': 'strong'}
+]
+# =========================================
 
 class NetworkController:
-    """网络控制器，用于设置网络条件 (依赖 sudo tc)"""
-    
     def __init__(self, interface='eth0'):
         self.interface = interface
     
-    def reset_network(self):
-        """清除网络限制"""
+    def set_network(self, bw, delay, loss):
+        # 先清除旧规则
+        subprocess.run(['sudo', 'tc', 'qdisc', 'del', 'dev', self.interface, 'root'], 
+                      stderr=subprocess.DEVNULL, check=False)
+        # 设置新规则
+        cmd = [
+            'sudo', 'tc', 'qdisc', 'add', 'dev', self.interface, 'root', 'netem',
+            'rate', f'{bw}mbit', 'delay', f'{delay}ms', 'loss', f'{loss}%'
+        ]
         try:
-            subprocess.run(['sudo', 'tc', 'qdisc', 'del', 'dev', self.interface, 'root'], 
-                          stderr=subprocess.DEVNULL, check=False)
-            print("  Network settings reset.")
-        except Exception as e:
-            print(f"  Error resetting network: {e}")
-    
-    def set_network(self, bandwidth, delay, loss):
-        """设置网络条件"""
-        try:
-            # 清除之前的设置
-            self.reset_network()
-            
-            # 设置新的网络条件 (使用 netem 模拟带宽、延迟和丢包)
-            cmd = [
-                'sudo', 'tc', 'qdisc', 'add', 'dev', self.interface, 'root', 'netem',
-                'rate', f'{bandwidth}mbit',
-                'delay', f'{delay}ms',
-                'loss', f'{loss}%'
-            ]
             subprocess.run(cmd, check=True)
-            print(f"  Network set: {bandwidth}Mbps, {delay}ms delay, {loss}% loss")
+            print(f"  ⚡ [Network] Set to {bw}Mbps, {delay}ms, {loss}% loss")
         except Exception as e:
-            print(f"  Error setting network: {e}")
+            print(f"  ❌ [Network] Error: {e}")
 
+    def reset(self):
+        subprocess.run(['sudo', 'tc', 'qdisc', 'del', 'dev', self.interface, 'root'], 
+                      stderr=subprocess.DEVNULL, check=False)
 
 class NativeClient:
-    """模拟原生Docker客户端（单线程，傻瓜式下载）"""
-    
-    def __init__(self, server_ip):
-        self.server_ip = server_ip
-        self.base_url = f"http://{server_ip}"
-    
-    def download(self, file_path, timeout=120):
-        """单线程下载文件"""
-        url = f"{self.base_url}/{file_path}"
-        print(f"  Downloading {file_path} (Native - Single Thread)...")
-        
-        start_time = time.time()
-        try:
-            # stream=True 避免一次性读入内存
-            response = requests.get(url, timeout=timeout, stream=True)
-            response.raise_for_status()
-            
-            total_bytes = 0
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    total_bytes += len(chunk)
-            
-            end_time = time.time()
-            duration = end_time - start_time
-            throughput = total_bytes / (1024 * 1024) / duration  # MB/s
-            
-            print(f"  ✔ Completed: {duration:.2f}s, {throughput:.2f}MB/s")
-            return duration, throughput
-        except requests.exceptions.Timeout:
-            print(f"  ❌ TIMEOUT after {timeout}s")
-            return None, None
-        except Exception as e:
-            print(f"  ❌ Failed: {e}")
-            return None, None
+    def __init__(self, base_url):
+        self.base_url = base_url
 
+    def download(self, filename):
+        target = f"{filename}.gz"
+        url = f"{self.base_url}/{target}"
+        start = time.time()
+        try:
+            # 缩短超时时间到 300s，避免弱网下卡太久
+            resp = requests.get(url, timeout=300, stream=True)
+            resp.raise_for_status()
+            size = 0
+            for chunk in resp.iter_content(8192): size += len(chunk)
+            dur = time.time() - start
+            return dur
+        except Exception as e:
+            return None
 
 class CTSClient:
-    """模拟CTS客户端（AI决策 + 多线程 + 动态分片）"""
-    
-    def __init__(self, server_ip):
-        self.server_ip = server_ip
-        self.base_url = f"http://{server_ip}"
-        self.lock = threading.Lock()
-        self.downloaded_bytes = 0
-    
+    def __init__(self, base_url):
+        self.base_url = base_url
+
     def download_chunk(self, url, start, end):
-        """下载指定范围的分片"""
-        headers = {'Range': f'bytes={start}-{end}'}
         try:
-            response = requests.get(url, headers=headers, timeout=30)
-            if response.status_code in [200, 206]:
-                return len(response.content)
-            return 0
-        except Exception:
-            return 0
-    
-    def download(self, file_base_name, strategy, num_threads=8):
-        """
-        根据策略自动选择后缀，并行下载
-        strategy: 'weak' (IoT) -> .br
-                  'balanced' (Edge) -> .zst
-                  'strong' (Cloud) -> .lz4
-        """
-        # 1. 模拟 AI 决策选择文件格式
-        if strategy == 'weak':
-            file_path = file_base_name.replace('.tar', '.tar.br')
-            algo_name = "Brotli"
-        elif strategy == 'balanced':
-            file_path = file_base_name.replace('.tar', '.tar.zst')
-            algo_name = "Zstd"
-        elif strategy == 'strong':
-            file_path = file_base_name.replace('.tar', '.tar.lz4')
-            algo_name = "LZ4"
-        else:
-            file_path = file_base_name # fallback
-            algo_name = "Raw"
+            h = {'Range': f'bytes={start}-{end}'}
+            r = requests.get(url, headers=h, timeout=30)
+            return len(r.content)
+        except: return 0
 
-        url = f"{self.base_url}/{file_path}"
-        print(f"  Downloading {file_path} (CTS - {num_threads} Threads, AI: {algo_name})...")
+    def download(self, filename, strategy):
+        suffix = '.lz4'
+        if strategy == 'weak': suffix = '.br'
+        elif strategy == 'balanced': suffix = '.zst'
         
-        # 2. 获取文件大小
+        target = f"{filename}{suffix}"
+        url = f"{self.base_url}/{target}"
+        
         try:
-            response = requests.head(url)
-            total_size = int(response.headers.get('Content-Length', 0))
-            if total_size == 0:
-                print("  ❌ Error: File not found or empty on server.")
-                return None, None
-        except Exception as e:
-            print(f"  ❌ Error connecting to server: {e}")
-            return None, None
-        
-        # 3. 计算分片
-        chunk_size = max(total_size // num_threads, 1024*1024)
+            head = requests.head(url, timeout=10)
+            total = int(head.headers.get('Content-Length', 0))
+        except: return None
+
+        pool_size = 8
+        chunk_size = max(total // pool_size, 1024*1024)
         futures = []
-        self.downloaded_bytes = 0
+        start_t = time.time()
         
-        start_time = time.time()
-        
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            for start in range(0, total_size, chunk_size):
-                end = min(start + chunk_size - 1, total_size - 1)
-                futures.append(executor.submit(self.download_chunk, url, start, end))
+        with ThreadPoolExecutor(pool_size) as ex:
+            for s in range(0, total, chunk_size):
+                e = min(s + chunk_size - 1, total - 1)
+                futures.append(ex.submit(self.download_chunk, url, s, e))
+            for f in as_completed(futures): pass
             
-            # 简单的进度展示
-            completed_chunks = 0
-            for _ in as_completed(futures):
-                completed_chunks += 1
-                # print(f"\r  Progress: {completed_chunks}/{len(futures)} chunks", end="")
-        
-        end_time = time.time()
-        duration = end_time - start_time
-        throughput = total_size / (1024 * 1024) / duration  # MB/s
-        
-        print(f"  ✔ Completed: {duration:.2f}s, {throughput:.2f}MB/s")
-        return duration, throughput
+        dur = time.time() - start_t
+        return dur
 
+def get_stats(data_list):
+    """计算平均值和标准差"""
+    if not data_list: return 0, 0
+    if len(data_list) == 1: return data_list[0], 0
+    return statistics.mean(data_list), statistics.stdev(data_list)
 
-def run_experiment():
+def run():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--ip', type=str, default='47.121.127.59', help='Server IP')
+    parser.add_argument('--ip', required=True, help="Server IP")
     args = parser.parse_args()
-    
-    net_ctrl = NetworkController()
-    native_client = NativeClient(args.ip)
-    cts_client = CTSClient(args.ip)
+
+    net = NetworkController()
+    native = NativeClient(f"http://{args.ip}")
+    cts = CTSClient(f"http://{args.ip}")
     
     results = []
     
-    print("="*70)
-    print("🚀 CTS System vs Native Docker: End-to-End Performance Experiment")
-    print("="*70)
-    
-    # ==========================================
-    # 场景 A: IoT 极端弱网 (2Mbps, 5% Loss)
-    # 策略: Native下 .gz, CTS下 .br (Brotli)
-    # 优化: 使用文本型数据，展示 Brotli 的极致压缩比
-    # ==========================================
-    print("\n[SCENARIO A] IoT Weak Network (2Mbps, 400ms RTT, 5% Loss)")
-    net_ctrl.set_network(bandwidth=2, delay=400, loss=5)
-    time.sleep(2)
-    
-    # 1. Native
-    d_native, t_native = native_client.download('generalized_text.tar.gz')
-    if d_native:
-        results.append({'Scenario': 'A-IoT', 'Type': 'Native', 'File': '.gz (Text)', 'Time': d_native, 'Speed': t_native, 'Ratio': 1.0})
+    print("="*60)
+    print(f"🎓 Thesis Experiment: Full Matrix x {REPEAT_COUNT} Repeats")
+    print("="*60)
+    print("⚠️  Estimated time: 1.5 - 2 Hours. Do not close terminal.\n")
 
-    # 2. CTS
-    d_cts, t_cts = cts_client.download('generalized_text.tar', 'weak')
-    if d_cts:
-        ratio = d_native / d_cts if d_native else 0
-        results.append({'Scenario': 'A-IoT', 'Type': 'CTS', 'File': '.br (Text)', 'Time': d_cts, 'Speed': t_cts, 'Ratio': ratio})
-
-    # ==========================================
-    # 场景 B: 边缘网络 (20Mbps, 1% Loss) -- 新增 Zstd
-    # 策略: Native下 .gz, CTS下 .zst (Zstd)
-    # 优化: 使用文本型数据，展示 Zstd 的均衡能力
-    # ==========================================
-    print("\n[SCENARIO B] Edge Network (20Mbps, 50ms RTT, 1% Loss)")
-    net_ctrl.set_network(bandwidth=20, delay=50, loss=1)
-    time.sleep(2)
-
-    # 1. Native
-    d_native, t_native = native_client.download('generalized_text.tar.gz')
-    if d_native:
-        results.append({'Scenario': 'B-Edge', 'Type': 'Native', 'File': '.gz (Text)', 'Time': d_native, 'Speed': t_native, 'Ratio': 1.0})
-
-    # 2. CTS
-    d_cts, t_cts = cts_client.download('generalized_text.tar', 'balanced')
-    if d_cts:
-        ratio = d_native / d_cts if d_native else 0
-        results.append({'Scenario': 'B-Edge', 'Type': 'CTS', 'File': '.zst (Text)', 'Time': d_cts, 'Speed': t_cts, 'Ratio': ratio})
-
-    # ==========================================
-    # 场景 C: 云数据中心 (100Mbps, 0% Loss)
-    # 策略: Native下 .gz, CTS下 .lz4 (LZ4)
-    # 优化: 使用二进制型数据，展示多线程消除 CPU/IO 瓶颈
-    # ==========================================
-    print("\n[SCENARIO C] Cloud Network (100Mbps, 20ms RTT, 0% Loss)")
-    net_ctrl.set_network(bandwidth=100, delay=20, loss=0)
-    time.sleep(2)
-
-    # 1. Native
-    d_native, t_native = native_client.download('generalized_binary.tar.gz')
-    if d_native:
-        results.append({'Scenario': 'C-Cloud', 'Type': 'Native', 'File': '.gz (Bin)', 'Time': d_native, 'Speed': t_native, 'Ratio': 1.0})
-
-    # 2. CTS
-    d_cts, t_cts = cts_client.download('generalized_binary.tar', 'strong')
-    if d_cts:
-        ratio = d_native / d_cts if d_native else 0
-        results.append({'Scenario': 'C-Cloud', 'Type': 'CTS', 'File': '.lz4 (Bin)', 'Time': d_cts, 'Speed': t_cts, 'Ratio': ratio})
-
-    # ==========================================
-    # 结果汇总
-    # ==========================================
-    net_ctrl.reset_network()
-    
-    csv_file = f"experiment_result_{datetime.now().strftime('%H%M%S')}.csv"
-    print(f"\n💾 Saving results to {csv_file}...")
-    
-    # 打印漂亮表格
-    print("\n" + "="*85)
-    print(f"{'Scenario':<12} | {'Type':<8} | {'File':<12} | {'Time(s)':<10} | {'Speed(MB/s)':<12} | {'Speedup':<8}")
-    print("-" * 85)
-    
-    with open(csv_file, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['Scenario', 'Type', 'File', 'Time', 'Speed', 'Ratio'])
-        writer.writeheader()
-        
-        for r in results:
-            writer.writerow(r)
-            time_str = f"{r['Time']:.2f}" if r['Time'] else "FAIL"
-            speed_str = f"{r['Speed']:.2f}" if r['Speed'] else "N/A"
-            ratio_str = f"{r['Ratio']:.2f}x" if r['Type'] == 'CTS' else "-"
+    try:
+        for scen in SCENARIOS:
+            print(f"\n🌍 [SCENARIO: {scen['name']}]")
+            net.set_network(scen['bw'], scen['delay'], scen['loss'])
+            time.sleep(2)
             
-            print(f"{r['Scenario']:<12} | {r['Type']:<8} | {r['File']:<12} | {time_str:<10} | {speed_str:<12} | {ratio_str:<8}")
-    print("="*85 + "\n")
+            for img in TEST_IMAGES:
+                print(f"\n  📦 Image: {img['name']}")
+                
+                # --- Native Loop ---
+                nat_times = []
+                for i in range(REPEAT_COUNT):
+                    print(f"     Running Native ({i+1}/{REPEAT_COUNT})... ", end='', flush=True)
+                    t = native.download(img['file'])
+                    if t: 
+                        nat_times.append(t)
+                        print(f"Done ({t:.2f}s)")
+                    else:
+                        print("Failed")
+                
+                # --- CTS Loop ---
+                cts_times = []
+                for i in range(REPEAT_COUNT):
+                    print(f"     Running CTS    ({i+1}/{REPEAT_COUNT})... ", end='', flush=True)
+                    t = cts.download(img['file'], scen['strategy'])
+                    if t:
+                        cts_times.append(t)
+                        print(f"Done ({t:.2f}s)")
+                    else:
+                        print("Failed")
+
+                # --- 统计与记录 ---
+                avg_nat, std_nat = get_stats(nat_times)
+                avg_cts, std_cts = get_stats(cts_times)
+                
+                # 只有当两个都有数据时才记录加速比
+                if avg_nat > 0 and avg_cts > 0:
+                    speedup = avg_nat / avg_cts
+                    results.append({
+                        'Scenario': scen['name'],
+                        'Image': img['name'],
+                        'Strategy': scen['strategy'],
+                        'Native_Mean': f"{avg_nat:.2f}",
+                        'Native_Std': f"{std_nat:.2f}",
+                        'CTS_Mean': f"{avg_cts:.2f}",
+                        'CTS_Std': f"{std_cts:.2f}",
+                        'Speedup': f"{speedup:.2f}"
+                    })
+                    print(f"  📊 Result: Native={avg_nat:.2f}s ±{std_nat:.2f}, CTS={avg_cts:.2f}s ±{std_cts:.2f} => {speedup:.2f}x Speedup")
+
+    finally:
+        net.reset()
+        print("\n⚡ Network Reset.")
+
+    # 保存结果
+    csv_file = f"thesis_results_final_{datetime.now().strftime('%d_%H%M')}.csv"
+    with open(csv_file, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            'Scenario', 'Image', 'Strategy', 
+            'Native_Mean', 'Native_Std', 
+            'CTS_Mean', 'CTS_Std', 
+            'Speedup'
+        ])
+        writer.writeheader()
+        writer.writerows(results)
+    
+    print(f"\n✅ Experiment Complete! Data saved to {csv_file}")
 
 if __name__ == '__main__':
-    run_experiment()
+    run()
