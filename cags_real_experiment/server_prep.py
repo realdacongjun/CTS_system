@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-server_prep.py - 在服务器上准备端到端实验所需的测试数据
+server_prep.py (V2.0) - 生成具有【真实压缩特性】的测试数据
 """
 
 import os
@@ -8,95 +8,125 @@ import subprocess
 import sys
 import random
 import string
+import time
 
-
-def generate_dummy_tar(base_filename, size_mb=100, entropy_type='binary'):
+def generate_realistic_text(filepath, target_mb=100):
     """
-    生成指定大小的虚拟tar文件
-    entropy_type: 'text' 表示低熵数据，'binary' 表示高熵数据
+    生成模拟服务器日志的文本文件
+    特点：有规律的结构 + 随机的内容，压缩率通常在 10:1 到 20:1 之间
     """
-    print(f"Generating {base_filename} ({size_mb}MB) with {entropy_type} entropy...")
+    print(f"📄 Generating Realistic Text (Logs): {filepath} ...")
     
-    # 生成文件内容
-    if entropy_type == 'text':
-        # 低熵：生成类似文本的内容
-        content = ''.join(random.choices(string.ascii_lowercase + ' \n\t', k=1024)).encode() * (size_mb * 1024)
-    else:
-        # 高熵：生成随机字节
-        content = os.urandom(size_mb * 1024 * 1024)
+    # 定义日志模板
+    log_levels = ['INFO', 'WARN', 'ERROR', 'DEBUG']
+    components = ['AuthService', 'PaymentGate', 'UserDB', 'Frontend']
+    messages = [
+        "Connection timed out while reaching upstream",
+        "User login successful for session_id",
+        "Database query took longer than expected",
+        "Invalid token provided in header",
+        "Cache miss for key user_profile",
+        "Garbage collection started",
+        "Request received from IP 192.168.1.X"
+    ]
     
-    # 写入文件
-    with open(base_filename, 'wb') as f:
-        f.write(content)
-    
-    print(f"Created {base_filename}")
+    with open(filepath, 'w') as f:
+        current_size = 0
+        target_bytes = target_mb * 1024 * 1024
+        
+        # 批量写入以提高性能
+        buffer = []
+        while current_size < target_bytes:
+            # 构造一行日志
+            ts = time.strftime('%Y-%m-%d %H:%M:%S')
+            level = random.choice(log_levels)
+            comp = random.choice(components)
+            msg = random.choice(messages)
+            rand_id = random.randint(10000, 99999)
+            
+            line = f"[{ts}] {level} [{comp}] {msg} - ID:{rand_id}\n"
+            buffer.append(line)
+            
+            if len(buffer) > 1000:
+                chunk = "".join(buffer)
+                f.write(chunk)
+                current_size += len(chunk.encode('utf-8'))
+                buffer = []
+        
+        # 写入剩余buffer
+        if buffer:
+            f.write("".join(buffer))
 
+def generate_semi_compressible_binary(filepath, target_mb=100):
+    """
+    生成半可压缩的二进制文件
+    原理：混合随机数据和重复数据块，模拟真实的二进制程序/库文件
+    压缩率预期：2:1 到 3:1
+    """
+    print(f"💿 Generating Semi-Compressible Binary: {filepath} ...")
+    
+    with open(filepath, 'wb') as f:
+        target_bytes = target_mb * 1024 * 1024
+        current_size = 0
+        
+        # 生成一个 1MB 的随机块
+        random_block = os.urandom(1024 * 1024)
+        
+        # 循环写入这个块（这样就有重复模式，利于LZ4/Gzip压缩），但每隔一段加点噪音
+        while current_size < target_bytes:
+            # 写入重复块 (可压缩部分)
+            f.write(random_block)
+            current_size += len(random_block)
+            
+            # 写入一点纯随机噪音 (防止压缩率过高)
+            noise = os.urandom(1024 * 100) # 100KB noise
+            f.write(noise)
+            current_size += len(noise)
 
 def compress_file(input_file, output_file, method):
-    """
-    使用指定方法压缩文件
-    """
-    print(f"Compressing {input_file} -> {output_file} using {method}...")
-    
+    print(f"   -> Compressing to {method}...")
     if method == 'gzip':
-        cmd = ['gzip', '-c', input_file]
-        with open(output_file, 'wb') as f_out:
-            subprocess.run(cmd, stdout=f_out, check=True)
+        # -6 是默认均衡模式
+        subprocess.run(['gzip', '-c', '-6', input_file], stdout=open(output_file, 'wb'), check=True)
     elif method == 'brotli':
-        cmd = ['brotli', '-q', '11', '-o', output_file, input_file]
-        subprocess.run(cmd, check=True)
+        # -q 5 稍微降低一点质量以加快生成速度，但依然比gzip强
+        subprocess.run(['brotli', '-q', '5', '-o', output_file, input_file], check=True)
     elif method == 'lz4':
-        cmd = ['lz4', '-f', input_file, output_file]
-        subprocess.run(cmd, check=True)
+        subprocess.run(['lz4', '-f', input_file, output_file], check=True)
     elif method == 'zstd':
-        # -3 是默认级别，最均衡；-f 是强制覆盖
-        cmd = ['zstd', '-3', '-f', input_file, '-o', output_file]
-        subprocess.run(cmd, check=True)
-    
-    print(f"Created {output_file}")
-
+        subprocess.run(['zstd', '-3', '-f', input_file, '-o', output_file], check=True)
 
 def main():
     nginx_dir = '/usr/share/nginx/html'
-    
-    # 检查是否具有写权限
     if not os.access(nginx_dir, os.W_OK):
-        print(f"Error: Cannot write to {nginx_dir}. Are you running as root?")
+        print("❌ Need root permission (sudo)")
         sys.exit(1)
-    
-    # 文件配置
-    files_to_create = [
-        ('generalized_text.tar', 'text'),
-        ('generalized_binary.tar', 'binary')
-    ]
-    
-    for base_name, entropy_type in files_to_create:
-        full_path = os.path.join(nginx_dir, base_name)
-        
-        # 检查基础文件是否存在
-        if not os.path.exists(full_path):
-            # 生成基础文件
-            temp_file = f'/tmp/{base_name}'
-            generate_dummy_tar(temp_file, size_mb=100, entropy_type=entropy_type)
-            
-            # 移动到nginx目录
-            os.rename(temp_file, full_path)
-        
-        # 生成压缩版本
-        compress_methods = [
-            ('.tar.gz', 'gzip'),
-            ('.tar.br', 'brotli'),
-            ('.tar.lz4', 'lz4'),
-            ('.tar.zst', 'zstd')  # 新增 Zstd 支持
-        ]
-        
-        for ext, method in compress_methods:
-            compressed_file = os.path.join(nginx_dir, base_name.replace('.tar', ext))
-            if not os.path.exists(compressed_file):
-                compress_file(full_path, compressed_file, method)
-    
-    print("All test files prepared successfully!")
 
+    # 1. 生成 Text (100MB)
+    text_tar = os.path.join(nginx_dir, 'generalized_text.tar')
+    generate_realistic_text(text_tar, 100)
+    
+    # 2. 生成 Binary (100MB)
+    bin_tar = os.path.join(nginx_dir, 'generalized_binary.tar')
+    generate_semi_compressible_binary(bin_tar, 100)
+
+    # 3. 压缩副本
+    files = [text_tar, bin_tar]
+    methods = [
+        ('.tar.gz', 'gzip'), 
+        ('.tar.br', 'brotli'), 
+        ('.tar.lz4', 'lz4'),
+        ('.tar.zst', 'zstd')
+    ]
+
+    for f in files:
+        print(f"\nProcessing {os.path.basename(f)}...")
+        for ext, method in methods:
+            out = f.replace('.tar', ext)
+            compress_file(f, out, method)
+            
+    print("\n✅ Data Generation Complete!")
+    subprocess.run(f"ls -lh {nginx_dir}/generalized*", shell=True)
 
 if __name__ == '__main__':
     main()
