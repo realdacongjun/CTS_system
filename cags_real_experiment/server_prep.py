@@ -113,7 +113,7 @@ def main():
         print("❌ 权限不足: 请使用 sudo 运行此脚本")
         sys.exit(1)
         
-    check_tools()· 
+    check_tools()
     
     if not os.path.exists(NGINX_ROOT):
         os.makedirs(NGINX_ROOT, exist_ok=True)
