@@ -154,12 +154,12 @@ def main():
     # [修改点1] 配置参数：允许通过环境变量或命令行参数配置IP
     server_ip = os.getenv('SERVER_IP', '47.121.137.243')  # 可通过环境变量配置
     SERVER_URL = f"http://{server_ip}:5000" 
-    TARGET_URL = f"http://{server_ip}/real_test.bin" 
-    OUTPUT_FILE = "downloaded_file.bin" 
+    BASE_TARGET_URL = f"http://{server_ip}/generalized_text.tar"  # 修改为基础URL，不含后缀
+    OUTPUT_FILE = "downloaded_file.tar" 
     
     # 图像信息
     IMAGE_INFO = {
-        'size_mb': 1024.0,  # 1GB镜像
+        'size_mb': 100.0,  # 修改为100MB以匹配服务器上的文件大小
         'avg_layer_entropy': 0.7,
         'text_ratio': 0.2,
         'layer_count': 5,
@@ -167,7 +167,7 @@ def main():
     }
     
     SERVER_INFO = {
-        'download_url': TARGET_URL
+        'download_url': BASE_TARGET_URL  # 传入基础URL，让服务端决定后缀
     }
     
     print("="*50)
@@ -175,7 +175,7 @@ def main():
     print("="*50)
     
     # 第一步：感知本地环境
-    client_info, profile = get_client_environment(TARGET_URL)
+    client_info, profile = get_client_environment(BASE_TARGET_URL)
     
     # 第二步：请求服务端AI决策
     strategy = request_server_strategy(SERVER_URL, client_info, IMAGE_INFO, SERVER_INFO)
@@ -184,7 +184,7 @@ def main():
         print("[Client] ⚠️  服务端不可达，使用默认策略进行下载...")
         # Fallback 策略
         strategy = {
-            'target_url': TARGET_URL,
+            'target_url': f"{BASE_TARGET_URL}.gz",  # 默认使用gzip
             'strategy': {
                 'initial_chunk_size': 2 * 1024 * 1024,  # 2MB
                 'concurrency': 3
@@ -198,7 +198,7 @@ def main():
         }
     
     # 获取下载参数
-    download_url = strategy['target_url']
+    download_url = strategy['target_url']  # 使用服务端返回的带后缀的URL
     chunk_size = strategy['strategy']['initial_chunk_size']
     concurrency = strategy['strategy']['concurrency']
     
@@ -219,12 +219,12 @@ def main():
                     file_size = int(content_range.split('/')[-1])
     except requests.exceptions.RequestException as e:
         print(f"[Client] ⚠️  网络请求失败: {e}")
-        print("[Client] ⚠️  使用默认文件大小 1GB")
-        file_size = 1024 * 1024 * 1024  # 1GB
+        print("[Client] ⚠️  使用默认文件大小 100MB")
+        file_size = 100 * 1024 * 1024  # 100MB
     except Exception as e:
         print(f"[Client] ⚠️  获取文件大小异常: {e}")
-        print("[Client] ⚠️  使用默认文件大小 1GB")
-        file_size = 1024 * 1024 * 1024  # 1GB
+        print("[Client] ⚠️  使用默认文件大小 100MB")
+        file_size = 100 * 1024 * 1024  # 100MB
     
     # 第四步：初始化AIMD修正层
     correction = CAGSCorrectionLayer(initial_chunk_size=chunk_size)

@@ -86,11 +86,11 @@ def negotiate_strategy():
         image_info = data.get('image_info', {})
         server_info = data.get('server_info', {})
         
-        print(f"\n[Server] 收到请求 | BW:{client_info.get('bandwidth_mbps')} | CPU:{client_info.get('cpu_load')}")
+        # 获取基础 URL (例如 http://47.121.xx.xx/generalized_mixed.tar)
+        base_url = server_info.get('download_url', DEFAULT_DOWNLOAD_URL)
         
-        # --- A. 特征预处理 ---
+        # --- A. 特征预处理 (保持不变) ---
         scaler = SimpleScaler()
-        
         raw_bw = float(client_info.get('bandwidth_mbps', 10.0))
         raw_cpu = float(client_info.get('cpu_load', 0.5))
         raw_rtt = float(client_info.get('rtt_ms', 50.0))
@@ -107,11 +107,10 @@ def negotiate_strategy():
         # Image 特征
         raw_size = float(image_info.get('size_mb', 100.0))
         norm_size = scaler.transform(raw_size, *IMAGE_STATS['total_size_mb'])
-        # 其他特征暂时给默认值，如果 smart_client 传了可以接
         image_vec = torch.FloatTensor([[norm_size, 0.5, 0.1, 5.0, 0.05]]).to(device)
         algo_vec = torch.LongTensor([0]).to(device)
 
-        # --- B. AI 推理 ---
+        # --- B. AI 推理 (保持不变) ---
         with torch.no_grad():
             preds = model(client_vec, image_vec, algo_vec)
             gamma, v, alpha, beta = preds[0]
@@ -138,20 +137,46 @@ def negotiate_strategy():
         
         print(f"[Strategy] 决策: 分片 {chunk_size/1024:.0f}KB | 并发 {concurrency}")
         
-        # --- D. 压缩算法排序 (你的新功能) ---
-        # 构造用于排序的 profile
+        # --- D. 压缩算法排序 & URL 构造 (⭐⭐⭐ 核心修改区 ⭐⭐⭐) ---
+        
+        # 1. 获取算法排序
         c_profile = {'bandwidth_mbps': raw_bw, 'cpu_score': 2000, 'decompression_speed': 200}
         i_profile = {'total_size_mb': raw_size, 'avg_layer_entropy': 0.65}
         
-        # 检查 strategy 是否有这个方法 (防止报错)
         if hasattr(strategy, 'predict_compression_times'):
             sorted_algorithms = strategy.predict_compression_times(c_profile, i_profile)
         else:
-            sorted_algorithms = [('default', 0.0)] # Fallback
+            sorted_algorithms = [('gzip-6', 0.0)] 
+
+        # 2. 拿到 AI 认为最好的算法
+        top_algo_name = sorted_algorithms[0][0]  # 例如 'brotli-6' 或 'lz4-fast'
         
+        # 3. 映射算法名到文件后缀 (这步至关重要！)
+        suffix_map = {
+            'brotli': '.br',
+            'zstd': '.zst',
+            'lz4': '.lz4',
+            'gzip': '.gz'
+        }
+        
+        # 模糊匹配：只要名字里包含 'brotli' 就用 .br
+        final_suffix = '.gz' # 默认
+        for key, sfx in suffix_map.items():
+            if key in top_algo_name:
+                final_suffix = sfx
+                break
+        
+        # 4. 构造最终下载链接
+        # 假设 base_url 是 ".../file.tar"，我们要变成 ".../file.tar.br"
+        # 先去掉可能存在的旧后缀，再加新后缀 (或者直接追加，取决于你生成文件的方式)
+        # 简单起见，我们假设客户端传来的 url 是不带压缩后缀的基础名
+        final_target_url = f"{base_url}{final_suffix}"
+        
+        print(f"[Server Decision] Algo:{top_algo_name} -> Suffix:{final_suffix} -> Threads:{concurrency}")
+
         # --- E. 返回响应 ---
         response_data = {
-            'target_url': server_info.get('download_url', DEFAULT_DOWNLOAD_URL),
+            'target_url': final_target_url,  # <--- 这里返回的是带后缀的 URL
             'strategy': {
                 'initial_chunk_size': int(chunk_size),
                 'concurrency': int(concurrency)
@@ -160,7 +185,8 @@ def negotiate_strategy():
                 'predicted_time_s': predicted_time_s,
                 'uncertainty': ai_uncertainty,
                 'cost': float(cost),
-                'top_algorithms': sorted_algorithms[:5] # 前5名
+                'top_algorithms': sorted_algorithms[:3],
+                'selected_algo': top_algo_name
             }
         }
         

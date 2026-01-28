@@ -3,7 +3,7 @@
 e2e_runner_thesis.py - 毕业设计专用：全矩阵 + 3次重复 + 统计分析 (最终修复版)
 集成：
 1. RealDownloader (防崩溃下载器)
-2. CTSClient (带阶梯判定逻辑：弱网2线程，强网8线程)
+2. CTSClient (使用AI决策模型)
 3. 统计分析模块
 """
 
@@ -15,8 +15,14 @@ import csv
 import os
 import threading
 import statistics
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+
+# 导入AI决策模型
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from cts_model import CTSDualTowerModel
+from cags_scheduler import CAGSStrategyLayer
 
 # =================配置区域=================
 REPEAT_COUNT = 3  # 重复次数
@@ -150,31 +156,183 @@ class RealDownloader:
         return True, total_time
 
 # =========================================================
-# 🧠 CTSClient: 包含阶梯判定逻辑
+# 🧠 CTSClient: 使用AI决策模型
 # =========================================================
 class CTSClient:
     def __init__(self, base_url):
         self.base_url = base_url
+        # 初始化AI决策模型
+        self.strategy_layer = CAGSStrategyLayer()
+        self.model_loaded = True
+        try:
+            # 尝试加载模型
+            from cts_model import CTSDualTowerModel
+            import torch
+            import os
+            
+            # 查找模型文件
+            possible_paths = [
+                "cts_best_model_full.pth",
+                "../ml_training/modeling/cts_best_model_full.pth",
+                os.path.join(os.path.dirname(__file__), "cts_best_model_full.pth"),
+                os.path.join(os.path.dirname(__file__), "../ml_training/modeling/cts_best_model_full.pth")
+            ]
+            model_path = next((p for p in possible_paths if os.path.exists(p)), None)
+            
+            if model_path:
+                device = torch.device("cpu")
+                self.ai_model = CTSDualTowerModel(client_feats=4, image_feats=5, num_algos=10).to(device)
+                # 使用安全方式加载模型
+                state_dict = torch.load(model_path, map_location=device, weights_only=True)
+                self.ai_model.load_state_dict(state_dict, strict=False)
+                self.ai_model.eval()
+                print("  ✅ AI模型加载成功！")
+            else:
+                print("  ⚠️  未找到AI模型文件，使用默认参数")
+                self.model_loaded = False
+        except Exception as e:
+            print(f"  ⚠️  AI模型加载失败: {e}，使用默认参数")
+            self.model_loaded = False
+
+    def calculate_uncertainty(self, beta, v, alpha):
+        """计算不确定性 U"""
+        return beta / (v * (alpha - 1) + 1e-6)
 
     def download(self, filename, strategy):
-        # -----------------------------------------------------
-        # 🎓 创新点二核心：本地强制执行“阶梯判定”
-        # -----------------------------------------------------
+        # 获取当前网络场景参数
+        scenario_map = {
+            'weak': {'bw': 2, 'delay': 400, 'loss': 5},
+            'balanced': {'bw': 20, 'delay': 50, 'loss': 1},
+            'strong': {'bw': 100, 'delay': 20, 'loss': 0}
+        }
         
-        # 1. 默认配置 (Strong/Cloud)
-        suffix = '.lz4'
-        pool_size = 8  # 默认 8 线程
+        scenario = scenario_map[strategy]
         
-        # 2. 根据当前实验场景强制调整
-        if strategy == 'weak': 
-            suffix = '.br'
-            pool_size = 2  # <--- 【关键】IoT场景强制 2 线程
-        elif strategy == 'balanced': 
-            suffix = '.zst'
-            pool_size = 4  # <--- 【关键】Edge场景强制 4 线程
+        # 模拟客户端环境信息
+        client_info = {
+            'bandwidth_mbps': scenario['bw'],
+            'rtt_ms': scenario['delay'],
+            'cpu_load': 0.3,  # 假设中等CPU负载
+            'memory_gb': 4.0   # 假设4GB内存
+        }
+        
+        # 模拟镜像信息
+        image_info = {
+            'total_size_mb': 100.0,  # 假设100MB镜像
+            'avg_layer_entropy': 0.65,
+            'text_ratio': 0.1,
+            'layer_count': 5,
+            'zero_ratio': 0.05
+        }
+        
+        if self.model_loaded:
+            # 使用AI模型进行推理
+            from cags_scheduler import SimpleScaler
             
-        # -----------------------------------------------------
-        
+            # 特征标准化
+            scaler = SimpleScaler()
+            
+            # 客户端特征
+            CLIENT_STATS = {
+                'bandwidth_mbps': (20.0, 30.0), 
+                'cpu_load': (0.5, 0.3),          
+                'network_rtt': (50.0, 80.0),      
+                'memory_gb': (8.0, 4.0)          
+            }
+            IMAGE_STATS = {
+                'total_size_mb': (200.0, 150.0), 
+                'avg_layer_entropy': (6.5, 1.0),
+                'text_ratio': (0.1, 0.1),
+                'layer_count': (10.0, 5.0),
+                'zero_ratio': (0.05, 0.05)
+            }
+            
+            raw_bw = float(client_info.get('bandwidth_mbps', 10.0))
+            raw_cpu = float(client_info.get('cpu_load', 0.5))
+            raw_rtt = float(client_info.get('rtt_ms', 50.0))
+            raw_mem = float(client_info.get('memory_gb', 4.0))
+            
+            # 标准化
+            norm_bw = scaler.transform(raw_bw, *CLIENT_STATS['bandwidth_mbps'])
+            norm_cpu = scaler.transform(raw_cpu, *CLIENT_STATS['cpu_load'])
+            norm_rtt = scaler.transform(raw_rtt, *CLIENT_STATS['network_rtt'])
+            norm_mem = scaler.transform(raw_mem, *CLIENT_STATS['memory_gb'])
+            
+            device = torch.device("cpu")
+            client_vec = torch.FloatTensor([[norm_bw, norm_cpu, norm_rtt, norm_mem]]).to(device)
+            
+            # Image 特征
+            raw_size = float(image_info.get('size_mb', 100.0))
+            norm_size = scaler.transform(raw_size, *IMAGE_STATS['total_size_mb'])
+            image_vec = torch.FloatTensor([[norm_size, 0.5, 0.1, 5.0, 0.05]]).to(device)
+            algo_vec = torch.LongTensor([0]).to(device)
+
+            # AI推理
+            with torch.no_grad():
+                preds = self.ai_model(client_vec, image_vec, algo_vec)
+                gamma, v, alpha, beta = preds[0]
+                
+                uncertainty_val = self.calculate_uncertainty(beta, v, alpha)
+                predicted_time_s = torch.expm1(gamma).item()
+                
+                # 获取AI决策的策略
+                predicted_risk_prob = 0.05 if predicted_time_s > 60 else 0.01
+                ai_uncertainty = min(1.0, max(0.0, uncertainty_val.item() / 10.0))
+                
+                # AI决策最优参数
+                best_config, cost = self.strategy_layer.optimize(
+                    predicted_bw_mbps=raw_bw, 
+                    predicted_loss_rate=predicted_risk_prob, 
+                    client_cpu_load=raw_cpu, 
+                    model_uncertainty=ai_uncertainty
+                )
+                
+                chunk_size, concurrency = best_config
+                
+                # 使用AI推荐的压缩算法
+                c_profile = {'bandwidth_mbps': raw_bw, 'cpu_score': 2000, 'decompression_speed': 200}
+                i_profile = {'total_size_mb': raw_size, 'avg_layer_entropy': 0.65}
+                
+                sorted_algorithms = self.strategy_layer.predict_compression_times(c_profile, i_profile)
+                
+                # 显示前3个推荐算法
+                print(f"     [AI Algorithm Ranking]:")
+                for idx, (algo, pred_time) in enumerate(sorted_algorithms[:3]):
+                    marker = "🏆" if idx == 0 else " "
+                    print(f"       {marker} {idx+1}. {algo} ({pred_time:.2f}s)")
+                
+                top_algorithm = sorted_algorithms[0][0]  # 选择预测时间最短的算法
+                
+                # 映射压缩算法到文件后缀
+                algo_suffix_map = {
+                    'gzip-1': '.gz', 'gzip-6': '.gz', 'gzip-9': '.gz',
+                    'zstd-1': '.zst', 'zstd-3': '.zst', 'zstd-6': '.zst', 'zstd-19': '.zst',
+                    'lz4-fast': '.lz4', 'lz4-medium': '.lz4', 'lz4-slow': '.lz4',
+                    'brotli-1': '.br', 'brotli-6': '.br', 'brotli-11': '.br'
+                }
+                
+                suffix = algo_suffix_map.get(top_algorithm, '.gz')
+                
+                print(f"     [AI Decision] -> Selected: {top_algorithm}, Suffix: {suffix}, Concurrency: {concurrency}")
+
+        else:
+            # 如果模型加载失败，使用启发式规则
+            # 根据网络场景选择默认配置
+            if strategy == 'weak': 
+                suffix = '.br'
+                chunk_size = 1024*1024  # 1MB分片
+                concurrency = 2  # 2线程
+            elif strategy == 'balanced': 
+                suffix = '.zst'
+                chunk_size = 2*1024*1024  # 2MB分片
+                concurrency = 4  # 4线程
+            else:  # strong
+                suffix = '.lz4'
+                chunk_size = 4*1024*1024  # 4MB分片
+                concurrency = 8  # 8线程
+            
+            print(f"     [Fallback] -> Suffix: {suffix}, Chunk: {chunk_size/1024/1024:.1f}MB, Concurrency: {concurrency}")
+
         target_name = f"{filename}{suffix}"
         url = f"{self.base_url}/{target_name}"
         
@@ -184,14 +342,18 @@ class CTSClient:
         except: 
             return None
 
-        # 3. 调用防崩溃下载器
-        # 不写真实文件 output_path='/dev/null'，纯测网络吞吐
+        # 调用防崩溃下载器
         downloader = RealDownloader(url, total_size, '/dev/null')
-        
-        print(f"     [Strategy:{strategy}] -> Format:{suffix}, Threads:{pool_size}")
 
-        # 4. 执行下载 (初始分片 1MB)
-        success, total_time = downloader.download_with_chunks(1024*1024, pool_size)
+        # =======================================================
+        # 🛑 【紧急修复】覆盖 AI 或 规则 的 chunk_size
+        # 即使 AI 建议 1MB，在 400ms 延迟下我们也要覆盖它，
+        # 强制让每个线程只跑一个长连接，避免 TCP 慢启动！
+        # =======================================================
+        final_chunk_size = max(total_size // concurrency, 1024*1024)
+
+        # 执行下载 (用修复后的 final_chunk_size)
+        success, total_time = downloader.download_with_chunks(final_chunk_size, concurrency)
         
         if success:
             return total_time
