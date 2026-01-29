@@ -21,8 +21,8 @@ REAL_IMAGES = {
     'generalized_os.tar': 'alpine:latest'
 }
 
-NGINX_ROOT = "/usr/share/nginx/html"
 
+NGINX_ROOT = "/var/www/html"
 def check_tools():
     """检查必要的系统工具"""
     required = ['docker', 'gzip', 'brotli', 'lz4', 'zstd']
