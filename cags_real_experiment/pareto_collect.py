@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 
 # ================= 🔧 全局配置 (Configuration) =================
-SERVER_IP = "47.121.127.59"
+SERVER_IP = "39.106.147.155"
 BASE_URL = f"http://{SERVER_IP}"
 OUTPUT_CSV = "thesis_final_dataset.csv"
 PLOT_DIR = "./thesis_figures"
