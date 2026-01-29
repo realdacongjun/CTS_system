@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 # ================= 配置 =================
 # 填入你 2核2G 服务端的公网 IP
-SERVER_IP = "47.121.127.59" 
+SERVER_IP = "39.106.147.155"
 CONTROLLER_API = f"http://{SERVER_IP}:5000/negotiate"
 FILE_URL_BASE = f"http://{SERVER_IP}"
 
