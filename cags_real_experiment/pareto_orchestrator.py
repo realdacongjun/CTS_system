@@ -70,23 +70,41 @@ http {
 }
 """)
 
+
+
 def build_server_image():
     """
-    [Methodology] Pre-bake Server Image
-    Ensures tc (iproute2) and ethtool are present without runtime network dependency.
+    [Methodology] Pre-bake Server Image (China Optimized)
+    Uses Aliyun mirrors to prevent 'apk add' timeouts on domestic servers.
     """
-    logging.info("🔨 Building custom Nginx image with Traffic Control tools...")
+    # 检查镜像是否已存在，如果存在且策略允许，可以跳过（这里为了稳健每次都 check）
+    try:
+        client.images.get(SERVER_IMAGE_TAG)
+        logging.info(f"⚡ Image {SERVER_IMAGE_TAG} already exists. Skipping build (remove it manually if you want to rebuild).")
+        return
+    except docker.errors.ImageNotFound:
+        logging.info(f"🔨 Building custom Nginx image (with Aliyun mirrors)...")
+
+    # 关键修改：换源到阿里云
     dockerfile = """
     FROM nginx:alpine
+    RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
     RUN apk add --no-cache iproute2 ethtool
     """
+    
     f = BytesIO(dockerfile.encode('utf-8'))
     try:
-        client.images.build(fileobj=f, tag=SERVER_IMAGE_TAG, rm=True)
+        # 打印构建日志以便调试
+        image, build_logs = client.images.build(fileobj=f, tag=SERVER_IMAGE_TAG, rm=True)
+        for chunk in build_logs:
+            if 'stream' in chunk:
+                logging.info(f"   [Build] {chunk['stream'].strip()}")
         logging.info(f"✅ Built server image: {SERVER_IMAGE_TAG}")
     except Exception as e:
         logging.critical(f"❌ Failed to build server image: {e}")
+        # 如果构建失败，抛出异常终止程序，不要硬跑
         raise e
+
 
 def disable_host_offload(network_id):
     bridge_name = f"br-{network_id[:12]}"
