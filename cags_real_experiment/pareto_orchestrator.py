@@ -127,38 +127,50 @@ def start_nginx_server(net):
         "net.ipv4.tcp_tw_reuse": "1",
         "net.ipv4.tcp_fin_timeout": "30"
     }
-    return client.containers.run(
-        SERVER_IMAGE_TAG,  # Using pre-built image
+    # First, run the container with basic nginx
+    container = client.containers.run(
+        "nginx:alpine",
         name="cts_server",
         detach=True, 
         network=NETWORK_NAME,
-        cpuset_cpus="3", 
+        cpuset_cpus="3", # Server on Core 3
         mem_limit="1g",
         sysctls=sysctls,
-        cap_add=["NET_ADMIN"], # Critical for TC/Ethtool
+        privileged=True,  # Required for network traffic control
+        cap_add=["NET_ADMIN"],  # Required for tc commands
         volumes={
             DATA_BIN: {'bind': '/usr/share/nginx/html/data.bin', 'mode': 'ro'},
             NGINX_CONF: {'bind': '/etc/nginx/nginx.conf', 'mode': 'ro'}
         }
     )
+    
+    # Install network tools in the running container
+    result = container.exec_run("apk add --no-cache iproute2 ethtool")
+    if result.exit_code != 0:
+        print(f"Warning: Failed to install network tools: {result.output.decode()}")
+    
+    return container
 
 def configure_network(server, params):
-    # No installation needed, tools are in the image.
-    
-    # [Methodology Fix] Disable Container-side Offload
+    exit_code, _ = server.exec_run("which tc")
+    if exit_code != 0:
+        server.exec_run("apk add --no-cache iproute2 ethtool") # Ensure ethtool inside too
+
+    # [Methodology Fix] Disable Container-side Offload (Sender TSO)
     server.exec_run("ethtool -K eth0 tso off gso off gro off")
 
-    server.exec_run("tc qdisc del dev eth0 root", check=False)
+    server.exec_run("tc qdisc del dev eth0 root force")
     
+    # [Methodology Fix] Hierarchy: Root HTB (Rate) -> Class -> Netem (Delay)
     cmds = [
         "tc qdisc add dev eth0 root handle 1: htb default 10",
         f"tc class add dev eth0 parent 1: classid 1:10 htb rate {params['bw']}mbit ceil {params['bw']}mbit",
         f"tc qdisc add dev eth0 parent 1:10 handle 10: netem delay {params['delay']}ms loss {params['loss']}%"
     ]
     for cmd in cmds:
-        exit_code, output = server.exec_run(cmd)
-        if exit_code != 0:
-            logging.error(f"TC Error: {output.decode()}")
+        res = server.exec_run(cmd)
+        if res.exit_code != 0:
+            logging.error(f"TC Error: {res.output.decode()}")
 
 def validate_rtt_sanity(net, server, params):
     logging.info(f"🔎 Validating RTT Integrity for {params['delay']}ms delay...")
