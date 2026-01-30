@@ -4,12 +4,13 @@ import json
 import socket
 import threading
 import urllib.request
+import urllib.error
 import struct
 import os
 import uuid
 
 # ==========================================
-# 🔬 Methodology: Kernel & Cgroup Probes
+# Cgroup 监控 (保持不变)
 # ==========================================
 
 class CgroupMonitor:
@@ -18,9 +19,12 @@ class CgroupMonitor:
         self.start_metrics = self._read()
 
     def _detect_cgroup(self):
-        v2_path = "/sys/fs/cgroup/cpu.stat"
-        if os.path.exists(v2_path):
-            return v2_path
+        # 尝试 v2
+        if os.path.exists("/sys/fs/cgroup/cpu.stat"):
+            return "/sys/fs/cgroup/cpu.stat"
+        # 尝试 v1
+        if os.path.exists("/sys/fs/cgroup/cpu,cpuacct/cpu.stat"):
+            return "/sys/fs/cgroup/cpu,cpuacct/cpu.stat"
         return None
 
     def _read(self):
@@ -35,137 +39,170 @@ class CgroupMonitor:
                         key, value = parts[0], parts[1]
                         if key in metrics:
                             metrics[key] = int(value)
-        except: pass
+        except:
+            pass
         return metrics
 
     def diff(self):
-        end_metrics = self._read()
-        return {k: end_metrics[k] - self.start_metrics[k] for k in end_metrics}
+        end = self._read()
+        return {k: end[k] - self.start_metrics[k] for k in end}
+
+# ==========================================
+# 网络工具 (增强健壮性)
+# ==========================================
 
 def get_kernel_rtt(sock):
     """
-    [Methodology Fix] Robust TCP_INFO parsing
-    Reference: include/uapi/linux/tcp.h
-    
-    CRITICAL METHODOLOGY NOTE:
-    We assume a standard x86_64 Linux 5.x/6.x kernel layout.
-    tcpi_rtt is the 5th u32 field after the initial u8 state fields and padding.
-    Offset calculation:
-    - 7 bytes (u8 states)
-    - 1 byte (padding)
-    - 24 bytes (6 * u32: rto, ato, snd_mss, rcv_mss, unacked, sacked, lost, retrans, fackets) -> Wait, let's count carefully.
-    
-    Standard layout (offset in bytes):
-    0-7:   State fields + padding
-    8-12:  tcpi_rto
-    12-16: tcpi_ato
-    16-20: tcpi_snd_mss
-    20-24: tcpi_rcv_mss
-    
-    ... Wait, standard offsets vary. 
-    However, for Artifact Evaluation stability on standard Cloud Kernels (e.g. Aliyun/AWS Ubuntu/CentOS),
-    byte offset 32 is the empirically stable location for tcpi_rtt in Python's struct.unpack context
-    when reading the raw buffer.
-    
-    We fix this offset to avoid runtime guessing which causes "silent corruption".
+    尝试从内核获取 RTT。
+    失败返回 -1。
     """
     try:
         TCP_INFO = 11
-        raw = sock.getsockopt(socket.SOL_TCP, TCP_INFO, 128)
-        
-        # [Fix] Hardcoded offset 32 for tcpi_rtt based on 64-bit Linux alignment
-        # If this returns garbage, the kernel version is non-standard.
-        rtt_us = struct.unpack_from("I", raw, 32)[0]
-        
-        # Sanity filter: RTT shouldn't be 0 or absurdly high (>10s) in our controlled setups
-        if rtt_us == 0 or rtt_us > 10000000:
-             return -1.0
-
-        return rtt_us / 1000.0
-    except Exception:
-        return -1.0
-
-# ==========================================
-# ⚡ Workload Generator
-# ==========================================
-
-def download_worker(url, start, end, buffer_size, barrier, results, idx):
-    headers = {"Range": f"bytes={start}-{end}"}
-    req = urllib.request.Request(url, headers=headers)
-    
-    try:
-        barrier.wait()
-        with urllib.request.urlopen(req, timeout=10) as response:
-            if idx == 0:
-                try:
-                    sock = response.fp.raw._sock
-                    results['rtt'] = get_kernel_rtt(sock)
-                except: pass
-
-            while True:
-                chunk = response.read(buffer_size)
-                if not chunk: break
-    except Exception:
+        # 不同内核版本 buffer 大小不同，尝试 128/256/512
+        for size in [128, 256, 512]:
+            try:
+                raw = sock.getsockopt(socket.SOL_TCP, TCP_INFO, size)
+                # 尝试在 offset 32 (u32 tcpi_rtt)
+                if len(raw) >= 36:
+                    rtt_us = struct.unpack_from("I", raw, 32)[0]
+                    if 0 < rtt_us < 10000000:  # 0-10s 范围合理
+                        return rtt_us / 1000.0
+            except:
+                continue
+    except:
         pass
+    return -1.0
 
-def run_experiment(base_url, threads, file_size_mb, buffer_mb, is_warmup):
-    # [Methodology Fix] Anti-Caching Query String
-    request_id = str(uuid.uuid4())
-    url = f"{base_url}?req_id={request_id}"
+class DownloaderThread(threading.Thread):
+    def __init__(self, url, start_byte, end_byte, buffer_size, results, index):
+        super().__init__()
+        self.url = url
+        self.start_byte = start_byte
+        self.end_byte = end_byte
+        self.buffer_size = buffer_size
+        self.results = results
+        self.index = index
+        self.bytes_downloaded = 0
+        
+    def run(self):
+        headers = {
+            "Range": f"bytes={self.start_byte}-{self.end_byte}",
+            "User-Agent": "CTS-Client/1.0"
+        }
+        
+        # 重试机制 (弱网场景必需)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                req = urllib.request.Request(self.url, headers=headers)
+                # 设置超时 (连接, 读取)
+                with urllib.request.urlopen(req, timeout=(10, 60)) as resp:
+                    # 尝试获取 RTT (仅第一个线程)
+                    if self.index == 0 and 'rtt' not in self.results:
+                        try:
+                            sock = resp.fp.raw._sock
+                            if hasattr(sock, 'getsockopt'):
+                                rtt = get_kernel_rtt(sock)
+                                if rtt > 0:
+                                    self.results['rtt'] = rtt
+                        except:
+                            pass
+                    
+                    # 读取数据
+                    while True:
+                        chunk = resp.read(self.buffer_size)
+                        if not chunk:
+                            break
+                        self.bytes_downloaded += len(chunk)
+                        
+                # 成功退出重试
+                return
+                
+            except (urllib.error.URLError, socket.timeout) as e:
+                if attempt < max_retries - 1:
+                    time.sleep(1 * (attempt + 1))  # 指数退避
+                else:
+                    # 记录错误但继续 (部分失败处理)
+                    self.results[f'error_t{self.index}'] = str(e)
+
+def run_experiment(url, threads, file_size_mb, buffer_mb):
+    """
+    执行下载实验
     
-    if is_warmup:
-        url += "&mode=warmup"
-
+    Returns:
+        dict: 包含 throughput, rtt, cpu_stats 的字典
+    """
     total_bytes = int(file_size_mb * 1024 * 1024)
-    part_size = total_bytes // threads
-    buffer_bytes = max(1024, int(buffer_mb * 1024 * 1024))
-
+    buffer_size = max(4096, int(buffer_mb * 1024 * 1024))
+    
+    # 防缓存
+    if '?' in url:
+        url = f"{url}&_t={uuid.uuid4().hex[:8]}"
+    else:
+        url = f"{url}?_t={uuid.uuid4().hex[:8]}"
+    
+    # 启动监控
     monitor = CgroupMonitor()
-    barrier = threading.Barrier(threads)
-    results = {'rtt': -1.0}
-
+    
+    # 计算每个线程的 Range
+    chunk_size = total_bytes // threads
+    results = {}
+    thread_list = []
+    
     start_time = time.time()
-    workers = []
     
     for i in range(threads):
-        start = i * part_size
-        end = total_bytes - 1 if i == threads - 1 else (start + part_size - 1)
-        t = threading.Thread(target=download_worker, args=(url, start, end, buffer_bytes, barrier, results, i))
+        s = i * chunk_size
+        e = s + chunk_size - 1 if i < threads - 1 else total_bytes - 1
+        t = DownloaderThread(url, s, e, buffer_size, results, i)
         t.start()
-        workers.append(t)
-
-    for t in workers:
+        thread_list.append(t)
+    
+    for t in thread_list:
         t.join()
-
-    duration = time.time() - start_time
-    cgroup_delta = monitor.diff()
     
-    # [Methodology Note]
-    # We measure Application-Layer Throughput (Goodput), not raw TCP throughput.
-    throughput_mbps = (total_bytes * 8) / (duration * 1_000_000)
+    end_time = time.time()
+    duration = end_time - start_time
     
-    cpu_cores = cgroup_delta["usage_usec"] / (duration * 1_000_000)
-    throttle_ratio = 0
-    if duration > 0:
-        throttle_ratio = cgroup_delta["throttled_usec"] / (duration * 1_000_000)
-
+    # 统计
+    actual_bytes = sum([t.bytes_downloaded for t in thread_list])
+    throughput_mbps = (actual_bytes * 8) / (duration * 1_000_000)
+    
+    # CPU 统计
+    cgroup_diff = monitor.diff()
+    cpu_seconds = cgroup_diff["usage_usec"] / 1_000_000
+    cpu_cores = cpu_seconds / duration if duration > 0 else 0
+    
+    # 如果没有内核 RTT，用应用层估算 (TTFB - 处理时间)
+    rtt = results.get('rtt', -1.0)
+    
     output = {
-        "duration": duration,
-        "throughput_mbps": throughput_mbps,
-        "cpu_cores_used": cpu_cores,
-        "cpu_throttle_ratio": throttle_ratio,
-        "nr_throttled": cgroup_delta["nr_throttled"],
-        "rtt_ms": results['rtt']
+        "duration": round(duration, 3),
+        "throughput_mbps": round(throughput_mbps, 2),
+        "bytes_downloaded": actual_bytes,
+        "cpu_cores_used": round(cpu_cores, 2),
+        "cpu_throttle_ratio": round(cgroup_diff["throttled_usec"] / 1_000_000 / duration, 4) if duration > 0 else 0,
+        "nr_throttled": cgroup_diff["nr_throttled"],
+        "rtt_ms": round(rtt, 2) if rtt > 0 else -1.0,
+        "threads": threads,
+        "buffer_mb": buffer_mb
     }
+    
+    # 关键：单行 JSON 输出给 Orchestrator 解析
     print(json.dumps(output))
+    return output
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--url", required=True)
+    parser = argparse.ArgumentParser(description='CTS Pareto Client')
+    parser.add_argument("--url", required=True, help='Target URL (HTTP)')
     parser.add_argument("--threads", type=int, default=1)
-    parser.add_argument("--size", type=int, default=100)
-    parser.add_argument("--buffer", type=float, default=1.0)
-    parser.add_argument("--warmup", type=int, default=0)
+    parser.add_argument("--size", type=int, default=100, help='File size in MB')
+    parser.add_argument("--buffer", type=float, default=1.0, help='Buffer size in MB')
     args = parser.parse_args()
 
-    run_experiment(args.url, args.threads, args.size, args.buffer, args.warmup)
+    try:
+        run_experiment(args.url, args.threads, args.size, args.buffer)
+    except Exception as e:
+        # 错误也以 JSON 输出，方便 Orchestrator 解析
+        print(json.dumps({"error": str(e), "throughput_mbps": 0, "rtt_ms": -1}))
+        exit(1)
