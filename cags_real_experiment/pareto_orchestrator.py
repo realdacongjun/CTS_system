@@ -623,8 +623,11 @@ http {
         server_ip = client.api.inspect_container(server_c.id)["NetworkSettings"]["Networks"][NETWORK_NAME]["IPAddress"]
         wait_for_network_steady_syn_only(server_ip)
         
-        # 5. Client
-        script_path = os.path.join(os.path.dirname(__file__), "pareto_client.py")
+
+
+        # 5. Client - 创建后验证 Python 环境和脚本
+        script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "pareto_client.py"))
+        
         client_c = client.containers.run(
             CLIENT_IMAGE, name=f"cli_{short_id}", detach=True, network=NETWORK_NAME,
             nano_cpus=config["nano_cpus"], mem_limit="512m",
@@ -632,24 +635,75 @@ http {
             command="sleep 3600"
         )
         
-        # 6. 执行（物理监控）
+        # ✅ 关键验证：确保 Python 和脚本可用
+        time.sleep(0.5)
+        check_cmd = "python3 --version && ls -la /app/client.py"
+        check_res = client_c.exec_run(check_cmd)
+        print(f"   [DEBUG] Client env check: {check_res.output.decode('utf-8', errors='ignore').strip()}")
+        
+        if check_res.exit_code != 0:
+            print(f"   [ERROR] Client environment check failed!")
+            return None
+        
+        
+        # 6. 执行（物理监控）- 修复 Docker SDK 7.x 兼容性和超时
+        import concurrent.futures
         with physical_monitor(client_c, config["nano_cpus"]) as mon:
             chunk_mb = config["chunk_size"] / (1024*1024)
             cmd = (f"python3 /app/client.py --url http://{server_ip}/data.bin "
                    f"--threads {config['threads']} --size {file_size} --buffer {chunk_mb}")
             
+            print(f"   [DEBUG] Executing: {cmd[:80]}...")
+            
+            # Docker SDK 7.x 兼容 + 超时处理
+            def exec_with_timeout(container, command, timeout_sec):
+                """适配 Docker SDK 7.x 的 exec_run 并添加超时"""
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(container.exec_run, command)
+                    try:
+                        result = future.result(timeout=timeout_sec)
+                        # Docker 7.x 返回 ExecResult 对象，有 exit_code 和 output 属性
+                        return result.exit_code, result.output
+                    except concurrent.futures.TimeoutError:
+                        print(f"   ❌ Client execution timeout ({timeout_sec}s)")
+                        try:
+                            container.kill()  # 强制停止卡住的客户觓
+                        except:
+                            pass
+                        return -1, b"TIMEOUT"
+                    except Exception as e:
+                        print(f"   ❌ Client execution error: {e}")
+                        return -1, b"ERROR"
+            
+            timeout_seconds = 600 if file_size == 300 else 300
             t0 = time.perf_counter()
-            exit_code, output = client_c.exec_run(cmd)
+            exit_code, output = exec_with_timeout(client_c, cmd, timeout_seconds)
             duration = time.perf_counter() - t0
             
-            # 解析 JSON
-            client_res = {}
-            for line in reversed(output.decode("utf-8", errors="ignore").strip().split("\n")):
-                if line.startswith("{") and line.endswith("}"):
-                    try: client_res = json.loads(line); break
-                    except: pass
+            # 调试输出
+            output_str = output.decode("utf-8", errors="ignore")
+            print(f"   [DEBUG] Exit code: {exit_code}, Duration: {duration:.2f}s")
+            if len(output_str) > 0:
+                print(f"   [DEBUG] Output last 200 chars: ...{output_str[-200:]}")
             
-            df_micro = mon.stop()  # 通过缓存避免重复
+            # 解析 JSON（增强版）
+            client_res = {}
+            if exit_code == 0 and output_str:
+                json_lines = [line.strip() for line in output_str.split('\n') 
+                             if line.strip().startswith('{') and line.strip().endswith('}')]
+                for line in reversed(json_lines):  # 从最后一行开始找
+                    try:
+                        client_res = json.loads(line)
+                        print(f"   [DEBUG] Got throughput: {client_res.get('throughput_mbps', 'N/A')} Mbps")
+                        break
+                    except json.JSONDecodeError:
+                        continue
+            
+            if not client_res:
+                print(f"   [WARN] Failed to parse result, output was: {output_str[:200]}...")
+            
+            df_micro = mon.stop()
+
         
         if exit_code not in [0, 2]:
             print(f"   ❌ Client failed: {exit_code}")
