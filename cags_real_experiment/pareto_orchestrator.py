@@ -10,6 +10,7 @@ import logging
 import glob
 import subprocess
 import re
+from io import BytesIO
 from datetime import datetime
 
 # ==========================================
@@ -23,6 +24,7 @@ BATCH_COOLDOWN = 15
 NETWORK_NAME = "cts_paper_net"
 DATA_FILE_PREFIX = "pareto_results_batch"
 FINAL_DATA_FILE = "pareto_results_final.csv"
+SERVER_IMAGE_TAG = "cts_server:research"
 
 CLIENT_SCRIPT = os.path.abspath("pareto_client.py")
 NGINX_CONF = os.path.abspath("nginx.conf")
@@ -53,11 +55,6 @@ def setup_host():
         logging.info(f"Generating {BASE_PAYLOAD_SIZE}MB random payload...")
         os.system(f"dd if=/dev/urandom of={DATA_BIN} bs=1M count={BASE_PAYLOAD_SIZE}")
     
-    # Save system metadata to a file for later analysis
-    metadata = get_system_metadata()
-    with open("experiment_metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
-    
     with open(NGINX_CONF, 'w') as f:
         f.write("""
 events { worker_connections 4096; }
@@ -73,21 +70,31 @@ http {
 }
 """)
 
+def build_server_image():
+    """
+    [Methodology] Pre-bake Server Image
+    Ensures tc (iproute2) and ethtool are present without runtime network dependency.
+    """
+    logging.info("🔨 Building custom Nginx image with Traffic Control tools...")
+    dockerfile = """
+    FROM nginx:alpine
+    RUN apk add --no-cache iproute2 ethtool
+    """
+    f = BytesIO(dockerfile.encode('utf-8'))
+    try:
+        client.images.build(fileobj=f, tag=SERVER_IMAGE_TAG, rm=True)
+        logging.info(f"✅ Built server image: {SERVER_IMAGE_TAG}")
+    except Exception as e:
+        logging.critical(f"❌ Failed to build server image: {e}")
+        raise e
+
 def disable_host_offload(network_id):
-    """
-    [Methodology Fix] Disable Offloading on Host Bridge
-    CRITICAL: Netem needs accurate packet boundaries. If the host bridge 
-    does GRO/LRO, it re-coalesces packets, defeating the delay model.
-    """
-    # Docker bridges are named 'br-<first 12 chars of ID>'
     bridge_name = f"br-{network_id[:12]}"
-    
     logging.info(f"🔧 Disabling HW offload on Host Bridge: {bridge_name}")
     try:
-        # Requires sudo/root on host
         subprocess.run(f"ethtool -K {bridge_name} tso off gso off gro off", shell=True, check=False)
     except Exception as e:
-        logging.warning(f"Failed to disable host offload (Need Root?): {e}")
+        logging.warning(f"Failed to disable host offload: {e}")
 
 def get_system_metadata():
     return {
@@ -103,15 +110,14 @@ def start_nginx_server(net):
         "net.ipv4.tcp_fin_timeout": "30"
     }
     return client.containers.run(
-        "nginx:alpine",
+        SERVER_IMAGE_TAG,  # Using pre-built image
         name="cts_server",
         detach=True, 
         network=NETWORK_NAME,
-        cpuset_cpus="3", # Server on Core 3
+        cpuset_cpus="3", 
         mem_limit="1g",
         sysctls=sysctls,
-        privileged=True,  # Required for network traffic control
-        cap_add=["NET_ADMIN"],  # Required for tc commands
+        cap_add=["NET_ADMIN"], # Critical for TC/Ethtool
         volumes={
             DATA_BIN: {'bind': '/usr/share/nginx/html/data.bin', 'mode': 'ro'},
             NGINX_CONF: {'bind': '/etc/nginx/nginx.conf', 'mode': 'ro'}
@@ -119,41 +125,27 @@ def start_nginx_server(net):
     )
 
 def configure_network(server, params):
-    exit_code, _ = server.exec_run("which tc")
-    if exit_code != 0:
-        server.exec_run("apk add --no-cache iproute2 ethtool") # Ensure ethtool inside too
-
-    # [Methodology Fix] Disable Container-side Offload (Sender TSO)
+    # No installation needed, tools are in the image.
+    
+    # [Methodology Fix] Disable Container-side Offload
     server.exec_run("ethtool -K eth0 tso off gso off gro off")
 
+    server.exec_run("tc qdisc del dev eth0 root", check=False)
     
-    try:
-        server.exec_run("tc qdisc del dev eth0 root")
-    except Exception as e:
-        logging.warning(f"Failed to delete qdisc: {e}")
-
-    # [Methodology Fix] Hierarchy: Root HTB (Rate) -> Class -> Netem (Delay)
     cmds = [
         "tc qdisc add dev eth0 root handle 1: htb default 10",
         f"tc class add dev eth0 parent 1: classid 1:10 htb rate {params['bw']}mbit ceil {params['bw']}mbit",
         f"tc qdisc add dev eth0 parent 1:10 handle 10: netem delay {params['delay']}ms loss {params['loss']}%"
     ]
     for cmd in cmds:
-        res = server.exec_run(cmd)
-        if res.exit_code != 0:
-            logging.error(f"TC Error: {res.output.decode()}")
+        exit_code, output = server.exec_run(cmd)
+        if exit_code != 0:
+            logging.error(f"TC Error: {output.decode()}")
 
 def validate_rtt_sanity(net, server, params):
-    """
-    [Methodology Check] Verify TCP_INFO RTT against ICMP Ping
-    This guards against kernel struct layout mismatches.
-    """
     logging.info(f"🔎 Validating RTT Integrity for {params['delay']}ms delay...")
-    
-    # 1. Run a quick ping check
     ping_cmd = f"ping -c 5 cts_server"
     try:
-        # Spin up a temp client
         client_check = client.containers.run(
             "python:3.9-slim",
             name="cts_validator",
@@ -164,24 +156,19 @@ def validate_rtt_sanity(net, server, params):
         logs = client_check.logs().decode()
         client_check.remove()
         
-        # Parse Ping RTT
-        # rtt min/avg/max/mdev = 400.1/400.5/401.2/0.5 ms
         match = re.search(r"min/avg/max/mdev = [\d\.]+/([\d\.]+)/", logs)
         if match:
             ping_rtt = float(match.group(1))
-            target_rtt = params['delay'] * 2 # Round trip
-            
-            # Allow 20% margin (Netem isn't perfect, OS scheduling noise)
+            target_rtt = params['delay'] * 2
             if abs(ping_rtt - target_rtt) > (target_rtt * 0.2 + 5):
                 logging.error(f"❌ RTT VALIDATION FAILED! Expected ~{target_rtt}ms, Got Ping={ping_rtt}ms")
-                logging.error("Check Host Offloading or Netem configuration!")
                 return False
             else:
                 logging.info(f"✅ RTT Sanity Passed: Ping={ping_rtt}ms matches Target={target_rtt}ms")
                 return True
     except Exception as e:
         logging.warning(f"RTT Validation skipped due to error: {e}")
-        return True # Don't block experiment on validation error, but log it
+        return True
     return True
 
 def run_trial(net, config, is_warmup=False):
@@ -208,7 +195,7 @@ def run_trial(net, config, is_warmup=False):
         try:
             result = container.wait(timeout=600) 
         except Exception:
-            logging.error("Client container timed out (hung)!")
+            logging.error("Client container timed out!")
             try: container.kill()
             except: pass
             container.remove()
@@ -288,6 +275,7 @@ def main():
         logging.warning("⚠️  Running without Root? Host offload disabling may fail.")
         
     setup_host()
+    build_server_image()
     cleanup_legacy()
     
     configs = generate_configs()
@@ -315,14 +303,11 @@ def main():
             except: pass
             net = client.networks.create(NETWORK_NAME, driver="bridge")
             
-            # [Methodology Fix] Disable Offload on Host Bridge immediately
             disable_host_offload(net.id)
             
             server = start_nginx_server(net)
             time.sleep(5) 
             
-            # [Methodology Fix] Perform RTT Sanity Check once per batch/network
-            # We pick the first config's network params to validate
             if len(current_batch) > 0:
                 first_net_params = current_batch[0]['net']
                 configure_network(server, first_net_params)
@@ -362,7 +347,6 @@ def main():
                                 try:
                                     server.restart()
                                     time.sleep(5)
-                                    server.exec_run("apk add --no-cache iproute2 ethtool") 
                                     configure_network(server, cfg['net'])
                                 except: pass
                         else:
