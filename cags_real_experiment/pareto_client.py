@@ -8,9 +8,10 @@ import urllib.error
 import struct
 import os
 import uuid
+import sys
 
 # ==========================================
-# Cgroup 监控 (保持不变)
+# Cgroup 监控
 # ==========================================
 
 class CgroupMonitor:
@@ -19,10 +20,8 @@ class CgroupMonitor:
         self.start_metrics = self._read()
 
     def _detect_cgroup(self):
-        # 尝试 v2
         if os.path.exists("/sys/fs/cgroup/cpu.stat"):
             return "/sys/fs/cgroup/cpu.stat"
-        # 尝试 v1
         if os.path.exists("/sys/fs/cgroup/cpu,cpuacct/cpu.stat"):
             return "/sys/fs/cgroup/cpu,cpuacct/cpu.stat"
         return None
@@ -48,28 +47,25 @@ class CgroupMonitor:
         return {k: end[k] - self.start_metrics[k] for k in end}
 
 # ==========================================
-# 网络工具 (增强健壮性)
+# 网络工具
 # ==========================================
 
 def get_kernel_rtt(sock):
-    """
-    尝试从内核获取 RTT。
-    失败返回 -1。
-    """
+    """尝试从内核获取 RTT，失败返回 -1"""
     try:
-        TCP_INFO = 11
-        # 不同内核版本 buffer 大小不同，尝试 128/256/512
-        for size in [128, 256, 512]:
+        TCP_INFO = getattr(socket, 'TCP_INFO', 11)
+        # 尝试不同 buffer 大小
+        for size in [128, 256, 512, 1024]:
             try:
                 raw = sock.getsockopt(socket.SOL_TCP, TCP_INFO, size)
-                # 尝试在 offset 32 (u32 tcpi_rtt)
                 if len(raw) >= 36:
-                    rtt_us = struct.unpack_from("I", raw, 32)[0]
-                    if 0 < rtt_us < 10000000:  # 0-10s 范围合理
+                    # tcpi_rtt 在 offset 28 (u32)
+                    rtt_us = struct.unpack_from("I", raw, 28)[0]
+                    if 0 < rtt_us < 60000000:  # 0-60s 合理
                         return rtt_us / 1000.0
             except:
                 continue
-    except:
+    except Exception as e:
         pass
     return -1.0
 
@@ -83,6 +79,7 @@ class DownloaderThread(threading.Thread):
         self.results = results
         self.index = index
         self.bytes_downloaded = 0
+        self.error_msg = None
         
     def run(self):
         headers = {
@@ -90,23 +87,46 @@ class DownloaderThread(threading.Thread):
             "User-Agent": "CTS-Client/1.0"
         }
         
-        # 重试机制 (弱网场景必需)
         max_retries = 3
+        last_error = None
+        
         for attempt in range(max_retries):
             try:
                 req = urllib.request.Request(self.url, headers=headers)
-                # 设置超时 (连接, 读取)
-                with urllib.request.urlopen(req, timeout=(10, 60)) as resp:
-                    # 尝试获取 RTT (仅第一个线程)
-                    if self.index == 0 and 'rtt' not in self.results:
+                
+                # ✅ 关键修复：timeout 使用单个值而非元组，避免 "got type tuple" 错误
+                # 如果必须用分别的连接和读取超时，使用单个保守值
+                timeout_val = 60  # 总超时 60 秒
+                
+                with urllib.request.urlopen(req, timeout=timeout_val) as resp:
+                    # 检查状态码：206 (Partial Content) 或 200 (OK，虽然不高效)
+                    status = resp.getcode()
+                    if status not in (200, 206):
+                        raise urllib.error.HTTPError(url, status, f"Unexpected status {status}", resp.headers, None)
+                    
+                    # 仅在 206 时测试 Range，200 意味着服务器忽略 Range，返回全部内容
+                    if status == 200 and self.start_byte > 0:
+                        # 服务器不支持 Range，但我们要求的是部分内容，这是一个问题
+                        print(f"Warning: Server returned 200 instead of 206 for Range request", file=sys.stderr)
+                    
+                    # 获取 RTT（仅第一个线程，且仅在成功连接后）
+                    if self.index == 0:
                         try:
-                            sock = resp.fp.raw._sock
-                            if hasattr(sock, 'getsockopt'):
+                            # ✅ 关键修复：安全获取 socket，处理可能的 wrapper
+                            sock = None
+                            if hasattr(resp, 'fp') and hasattr(resp.fp, '_sock'):
+                                raw_sock = resp.fp._sock
+                                if hasattr(raw_sock, 'getsockopt'):
+                                    sock = raw_sock
+                                elif hasattr(raw_sock, '_sock'):  # SSL wrapper
+                                    sock = raw_sock._sock
+                            
+                            if sock:
                                 rtt = get_kernel_rtt(sock)
                                 if rtt > 0:
                                     self.results['rtt'] = rtt
-                        except:
-                            pass
+                        except Exception as e:
+                            pass  # RTT 获取失败不重要
                     
                     # 读取数据
                     while True:
@@ -114,24 +134,30 @@ class DownloaderThread(threading.Thread):
                         if not chunk:
                             break
                         self.bytes_downloaded += len(chunk)
-                        
-                # 成功退出重试
+                
+                # 成功完成，退出重试循环
                 return
                 
-            except (urllib.error.URLError, socket.timeout) as e:
+            except (urllib.error.URLError, socket.timeout, urllib.error.HTTPError) as e:
+                last_error = str(e)
                 if attempt < max_retries - 1:
                     time.sleep(1 * (attempt + 1))  # 指数退避
                 else:
-                    # 记录错误但继续 (部分失败处理)
-                    self.results[f'error_t{self.index}'] = str(e)
+                    self.error_msg = last_error
+                    print(f"Thread {self.index} failed after {max_retries} attempts: {last_error}", file=sys.stderr)
+            except TypeError as e:
+                # 捕获 "got type tuple" 或其他类型错误
+                last_error = f"TypeError: {str(e)}"
+                print(f"Thread {self.index} TypeError: {e}", file=sys.stderr)
+                self.error_msg = last_error
+                return  # 不重试类型错误
+            except Exception as e:
+                last_error = f"Unexpected: {type(e).__name__}: {str(e)}"
+                print(f"Thread {self.index} unexpected error: {e}", file=sys.stderr)
+                self.error_msg = last_error
+                return
 
 def run_experiment(url, threads, file_size_mb, buffer_mb):
-    """
-    执行下载实验
-    
-    Returns:
-        dict: 包含 throughput, rtt, cpu_stats 的字典
-    """
     total_bytes = int(file_size_mb * 1024 * 1024)
     buffer_size = max(4096, int(buffer_mb * 1024 * 1024))
     
@@ -158,6 +184,7 @@ def run_experiment(url, threads, file_size_mb, buffer_mb):
         t.start()
         thread_list.append(t)
     
+    # 等待所有线程完成
     for t in thread_list:
         t.join()
     
@@ -166,14 +193,20 @@ def run_experiment(url, threads, file_size_mb, buffer_mb):
     
     # 统计
     actual_bytes = sum([t.bytes_downloaded for t in thread_list])
-    throughput_mbps = (actual_bytes * 8) / (duration * 1_000_000)
+    
+    # 收集错误信息
+    errors = [t.error_msg for t in thread_list if t.error_msg]
+    if errors:
+        results['errors'] = errors[:3]  # 只保留前3个错误
+    
+    throughput_mbps = (actual_bytes * 8) / (duration * 1_000_000) if duration > 0 else 0
     
     # CPU 统计
     cgroup_diff = monitor.diff()
     cpu_seconds = cgroup_diff["usage_usec"] / 1_000_000
     cpu_cores = cpu_seconds / duration if duration > 0 else 0
+    throttle_ratio = (cgroup_diff["throttled_usec"] / 1_000_000 / duration) if duration > 0 else 0
     
-    # 如果没有内核 RTT，用应用层估算 (TTFB - 处理时间)
     rtt = results.get('rtt', -1.0)
     
     output = {
@@ -181,14 +214,14 @@ def run_experiment(url, threads, file_size_mb, buffer_mb):
         "throughput_mbps": round(throughput_mbps, 2),
         "bytes_downloaded": actual_bytes,
         "cpu_cores_used": round(cpu_cores, 2),
-        "cpu_throttle_ratio": round(cgroup_diff["throttled_usec"] / 1_000_000 / duration, 4) if duration > 0 else 0,
+        "cpu_throttle_ratio": round(throttle_ratio, 4),
         "nr_throttled": cgroup_diff["nr_throttled"],
         "rtt_ms": round(rtt, 2) if rtt > 0 else -1.0,
         "threads": threads,
-        "buffer_mb": buffer_mb
+        "buffer_mb": buffer_mb,
+        "errors": errors if errors else None
     }
     
-    # 关键：单行 JSON 输出给 Orchestrator 解析
     print(json.dumps(output))
     return output
 
@@ -201,8 +234,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     try:
-        run_experiment(args.url, args.threads, args.size, args.buffer)
+        result = run_experiment(args.url, args.threads, args.size, args.buffer)
     except Exception as e:
-        # 错误也以 JSON 输出，方便 Orchestrator 解析
-        print(json.dumps({"error": str(e), "throughput_mbps": 0, "rtt_ms": -1}))
+        import traceback
+        error_output = {
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "throughput_mbps": 0,
+            "bytes_downloaded": 0,
+            "rtt_ms": -1
+        }
+        print(json.dumps(error_output))
         exit(1)
