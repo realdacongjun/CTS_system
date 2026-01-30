@@ -303,7 +303,7 @@ def run_single_experiment(client, config, run_id):
         estimated_rtt = get_ground_truth_rtt(net_cfg["delay"])
         
         # Client
-        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pareto_client_fixed.py")
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pareto_client.py")
         if not os.path.exists(script_path):
             raise FileNotFoundError(f"缺少客户端脚本: {script_path}")
         
