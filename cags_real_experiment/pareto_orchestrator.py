@@ -639,7 +639,7 @@ http {
                    f"--threads {config['threads']} --size {file_size} --buffer {chunk_mb}")
             
             t0 = time.perf_counter()
-            exit_code, output = client_c.exec_run(cmd, timeout=600 if file_size == 300 else 300)
+            exit_code, output = client_c.exec_run(cmd)
             duration = time.perf_counter() - t0
             
             # 解析 JSON
