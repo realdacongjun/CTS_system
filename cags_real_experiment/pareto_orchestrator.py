@@ -110,6 +110,8 @@ def start_nginx_server(net):
         cpuset_cpus="3", # Server on Core 3
         mem_limit="1g",
         sysctls=sysctls,
+        privileged=True,  # Required for network traffic control
+        cap_add=["NET_ADMIN"],  # Required for tc commands
         volumes={
             DATA_BIN: {'bind': '/usr/share/nginx/html/data.bin', 'mode': 'ro'},
             NGINX_CONF: {'bind': '/etc/nginx/nginx.conf', 'mode': 'ro'}
