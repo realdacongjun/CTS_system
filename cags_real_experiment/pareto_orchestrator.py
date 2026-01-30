@@ -562,25 +562,55 @@ def run_single_experiment(client, config, run_id):
     client_c = None
     veth = None
     ifb_name = None
-    
+
     try:
         # 1. Server
         short_id = f"{run_id}_{int(time.time()*1000)%10000}"
-        nginx_conf = """events{worker_connections 1024;}http{sendfile on;tcp_nopush on;client_max_body_size 500M;proxy_read_timeout 600s;send_timeout 600s;server{listen 80;root /usr/share/nginx/html;location/{add_header Accept-Ranges bytes;add_header Cache-Control no-cache;}}}"""
         
-        with open("/tmp/nginx.conf", "w") as f:
+        # ✅ 修复：正确的 Nginx 配置（注意 location / 有空格）
+        nginx_conf = """events {
+    worker_connections 1024;
+}
+http {
+    sendfile on;
+    tcp_nopush on;
+    client_max_body_size 500M;
+    proxy_read_timeout 600s;
+    send_timeout 600s;
+    
+    server {
+        listen 80;
+        root /usr/share/nginx/html;
+        location / {
+            add_header Accept-Ranges bytes;
+            add_header Cache-Control no-cache;
+        }
+    }
+}"""
+        
+        conf_path = "/tmp/nginx.conf"
+        with open(conf_path, "w") as f:
             f.write(nginx_conf)
         
         server_c = client.containers.run(
             SERVER_IMAGE, name=f"srv_{short_id}", detach=True, network=NETWORK_NAME,
             volumes={DATA_FILE: {"bind": "/usr/share/nginx/html/data.bin", "mode": "ro"},
-                     "/tmp/nginx.conf": {"bind": "/etc/nginx/nginx.conf", "mode": "ro"}},
+                     conf_path: {"bind": "/etc/nginx/nginx.conf", "mode": "ro"}},
             command="nginx -g 'daemon off;'"
         )
         
-        # 2. VETH
+        # ✅ 新增：检查容器是否存活（防止配置错误导致 silent fail）
+        time.sleep(1)  # 给 Docker 启动时间
+        server_c.reload()
+        if server_c.status != 'running':
+            logs = server_c.logs().decode('utf-8', errors='ignore')
+            print(f"   [ERROR] Server failed to start: {logs}")
+            return None
+        
+        # 2. VETH（此时容器肯定存活）
         veth = get_veth_kernel_native(server_c.id)
         print(f"   🌐 {veth}")
+        
         
         # 3. TC 配置（基线不加 TC）
         if not is_baseline:
