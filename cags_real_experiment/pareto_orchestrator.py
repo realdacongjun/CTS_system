@@ -124,8 +124,12 @@ def configure_network(server, params):
     # [Methodology Fix] Disable Container-side Offload (Sender TSO)
     server.exec_run("ethtool -K eth0 tso off gso off gro off")
 
-    server.exec_run("tc qdisc del dev eth0 root", check=False)
     
+    try:
+        server.exec_run("tc qdisc del dev eth0 root")
+    except Exception as e:
+        logging.warning(f"Failed to delete qdisc: {e}")
+
     # [Methodology Fix] Hierarchy: Root HTB (Rate) -> Class -> Netem (Delay)
     cmds = [
         "tc qdisc add dev eth0 root handle 1: htb default 10",
