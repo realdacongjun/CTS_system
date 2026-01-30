@@ -79,41 +79,50 @@ def prepare_test_file(max_size_mb=300):
 # 3. VETH 定位（内核原教旨）
 # ==============================
 
-def get_veth_kernel_native(container_id, timeout=15):
-    """使用 /sys/class/net/veth*/iflink 匹配容器 eth0 ifindex"""
+
+def get_veth_kernel_native(container_id, timeout=20):
+    """
+    修复版：使用 ip link 和 ethtool 标准工具，避免 sysfs 路径差异
+    """
     start = time.time()
     
     # 获取容器 PID
     pid = None
     while time.time() - start < timeout:
-        pid = sh(f"docker inspect -f '{{{{.State.Pid}}}}' {container_id}")
-        if pid and pid != '0':
-            break
-        time.sleep(0.2)
-    
-    if not pid:
-        raise RuntimeError("PID not available")
-    
-    # 获取容器内 eth0 的 ifindex
-    for _ in range(30):
         try:
-            eth0_idx = sh(f"nsenter -t {pid} -n cat /sys/class/net/eth0/ifindex")
-            if eth0_idx:
-                # 查找 iflink 等于该 ifindex 的 veth
-                for veth_path in glob.glob('/sys/class/net/veth*/iflink'):
-                    try:
-                        with open(veth_path, 'r') as f:
-                            peer_idx = f.read().strip()
-                            if peer_idx == eth0_idx:
-                                veth_name = os.path.basename(os.path.dirname(veth_path))
-                                return veth_name
-                    except:
-                        continue
+            pid = sh(f"docker inspect -f '{{{{.State.Pid}}}}' {container_id}")
+            if pid and pid != '0':
+                # 验证容器内网络已就绪（eth0 存在且 UP）
+                eth0_state = sh(f"nsenter -t {pid} -n ip link show eth0 2>/dev/null | grep 'state UP'", check=False)
+                if eth0_state:
+                    break
         except:
             pass
         time.sleep(0.3)
     
-    raise RuntimeError(f"Cannot locate veth for {container_id[:12]}")
+    if not pid:
+        raise RuntimeError("Container PID or network not ready")
+    
+    for attempt in range(10):
+        try:
+            # 在容器内执行 ethtool -S eth0，查找 peer_ifindex
+            peer_output = sh(f"nsenter -t {pid} -n ethtool -S eth0 2>/dev/null | grep peer_ifindex")
+            if peer_output:
+                # 解析 peer_ifindex 的值
+                peer_idx = peer_output.split(':')[-1].strip()
+                
+                # 在宿主机查找该 ifindex 对应的接口名
+                veth_name = sh(f"ip -o link show | grep '^[{peer_idx}]:' | awk -F': ' '{{print $2}}' | cut -d'@' -f1")
+                if veth_name and veth_name.startswith("veth"):
+                    return veth_name
+        except:
+            pass
+        time.sleep(0.5)
+    
+
+    
+    raise RuntimeError(f"Cannot locate veth for {container_id[:12]} after all methods")
+
 
 # ==============================
 # 4. TC 配置（完全隔离 IFB）
