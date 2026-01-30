@@ -103,6 +103,7 @@ def get_veth_kernel_native(container_id, timeout=20):
     if not pid:
         raise RuntimeError("Container PID or network not ready")
     
+    # 方法1：通过 ethtool 在容器内查看 peer ifindex（最可靠）
     for attempt in range(10):
         try:
             # 在容器内执行 ethtool -S eth0，查找 peer_ifindex
@@ -119,9 +120,56 @@ def get_veth_kernel_native(container_id, timeout=20):
             pass
         time.sleep(0.5)
     
-
+    # 方法2：通过 IP 地址反查（备选）
+    try:
+        # 获取容器 IP
+        container_ip = sh(f"docker inspect -f '{{{{range .NetworkSettings.Networks}}}}{{{{.IPAddress}}}}{{{{end}}}}' {container_id}")
+        
+        # 在宿主机上通过 arp 或 bridge fdb 查找
+        for _ in range(5):
+            # 尝试从 bridge fdb 获取
+            fdb_output = sh(f"bridge fdb show | grep '{container_ip}' | head -1", check=False)
+            if fdb_output:
+                parts = fdb_output.split()
+                if 'dev' in parts:
+                    idx = parts.index('dev')
+                    candidate = parts[idx + 1]
+                    if 'veth' in candidate:
+                        return candidate
+            
+            # 或者通过邻居表
+            neigh = sh(f"ip neigh show | grep '{container_ip}' | head -1", check=False)
+            if neigh:
+                # 解析出接口名
+                match = re.search(r'dev\s+(\S+)', neigh)
+                if match and 'veth' in match.group(1):
+                    return match.group(1)
+            
+            time.sleep(0.5)
+    except:
+        pass
+    
+    # 方法3：暴力扫描（最后手段）
+    try:
+        # 获取所有 veth 接口，逐个检查 iflink 是否指向容器的 eth0 ifindex
+        container_eth0_idx = sh(f"nsenter -t {pid} -n cat /sys/class/net/eth0/ifindex 2>/dev/null")
+        
+        veth_list = sh("ip -o link show type veth 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1")
+        for veth in veth_list.split():
+            veth = veth.strip()
+            if not veth:
+                continue
+            try:
+                peer_iflink = sh(f"cat /sys/class/net/{veth}/iflink 2>/dev/null")
+                if peer_iflink == container_eth0_idx:
+                    return veth
+            except:
+                continue
+    except:
+        pass
     
     raise RuntimeError(f"Cannot locate veth for {container_id[:12]} after all methods")
+
 
 
 # ==============================
