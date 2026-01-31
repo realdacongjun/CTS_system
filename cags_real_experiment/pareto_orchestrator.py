@@ -807,7 +807,8 @@ def main():
         pass
     
     prepare_test_file(300)
-    experiments = generate_hierarchical_experiments()
+    # ✅ 正确代码 (把全局变量传进去)
+    experiments = generate_hierarchical_experiments(NETWORK_SCENARIOS)
     
     print(f"\n📊 实验设计: {len(experiments)} 次实验")
     print("=" * 70)
@@ -833,3 +834,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
