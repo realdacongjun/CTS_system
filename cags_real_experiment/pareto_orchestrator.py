@@ -389,7 +389,7 @@ class PhysicalCPUMonitor:
                 
                 if sys_delta > 0:
                     cpu_percent = (cpu_delta / sys_delta) * self.host_cores / self.quota_cores * 100
-                    cpu_percent = min(cpu_percent, 100.0)
+                    cpu_percent = min(cpu_percent, self.quota_cores * 100)
                 else:
                     cpu_percent = 0.0
                 
@@ -477,12 +477,14 @@ def wait_for_network_steady_syn_only(server_ip, port=80, timeout=10):
 # 7. 分层采样实验生成器
 # ==============================
 
+from typing import List, Dict, Any
+
 def get_adjusted_file_size(net_name, base_size):
     """
     根据网络带宽调整文件大小，避免慢网场景超时：
-    - IoT_Weak (2mbit): 最大 10MB（约 40s 传输时间）
-    - Edge_Normal (20mbit): 最大 50MB（约 20s 传输时间）
-    - Cloud_Fast (1gbit): 保持 100MB（约 1s 传输时间）
+    - IoT_Weak (2mbit): 最大 10MB
+    - Edge_Normal (20mbit): 最大 50MB
+    - Cloud_Fast (1gbit): 保持 100MB
     """
     if "IoT" in net_name or "Weak" in net_name:
         return min(base_size, 10)
@@ -491,25 +493,40 @@ def get_adjusted_file_size(net_name, base_size):
     else:
         return base_size
 
-def generate_hierarchical_experiments() -> List[Dict[str, Any]]:
+def generate_hierarchical_experiments(NETWORK_SCENARIOS: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     experiments = []
-    
-    print("🎯 Layer 1: Anchor experiments (自适应大小)")
+    print("🎯 Generating Hierarchical Experiments...")
+
     for net in NETWORK_SCENARIOS:
         adj_size = get_adjusted_file_size(net['name'], 100)
-        
-        # 基线（无 TC）
+
+        # ==========================
+        # 1️⃣ Baseline Anchor
+        # ==========================
         experiments.append({
-            "network_scenarios": {"name": f"{net['name']}_BASELINE", "bw": "unlimited", "delay": "0ms", "loss": "0%"},
-            "cpu_quota": 1.0, "threads": 4, "chunk_size": 1024*1024, 
-            "file_size_mb": adj_size, "priority": 1, "nano_cpus": int(1e9),
+            "network_scenarios": {
+                "name": f"{net['name']}_BASELINE", 
+                "bw": "unlimited", 
+                "delay": "0ms", 
+                "loss": "0%"
+            },
+            "cpu_quota": 1.0,
+            "threads": 4,
+            "chunk_size": 1024*1024,
+            "file_size_mb": adj_size,
+            "priority": 1,
+            "nano_cpus": int(1e9),
             "exp_type": "anchor_baseline",
             "bandwidth_mbps": net.get('mbps', 1000)
         })
-        
-        # 全因子实验
+
+        # ==========================
+        # 2️⃣ Anchor 全因子实验
+        # ==========================
+        thread_list = [1, 2, 4] if "IoT" in net['name'] else [1, 2, 4, 8, 16]
+
         for cpu in [0.5, 1.0, 2.0]:
-            for t in [1, 2, 4, 8, 16]:
+            for t in thread_list:
                 for c in [256*1024, 1024*1024, 4*1024*1024]:
                     experiments.append({
                         "network_scenarios": net,
@@ -522,45 +539,68 @@ def generate_hierarchical_experiments() -> List[Dict[str, Any]]:
                         "priority": 1,
                         "bandwidth_mbps": net.get('mbps', 1000)
                     })
-    
-    # Probe Small (10MB)
-    print("🧪 Layer 2: Probe small")
-    for net in [NETWORK_SCENARIOS[0], NETWORK_SCENARIOS[2]]:
-        for cpu in [0.5, 2.0]:
-            for t in [1, 16]:
-                for c in [256*1024, 1024*1024]:
-                    experiments.append({
-                        "network_scenarios": net,
-                        "cpu_quota": cpu,
-                        "threads": t,
-                        "chunk_size": c,
-                        "file_size_mb": 10,
-                        "exp_type": "probe_small",
-                        "nano_cpus": int(cpu * 1e9),
-                        "priority": 2,
-                        "bandwidth_mbps": net.get('mbps', 1000)
-                    })
-    
-    # Probe Large (300MB) - 排除 IoT
-    print("🔬 Layer 3: Probe large")
-    for net in [NETWORK_SCENARIOS[1], NETWORK_SCENARIOS[2]]:
-        for cpu in [0.5, 1.0, 2.0]:
-            for t in [4, 8, 16]:
-                for c in [1024*1024, 4*1024*1024]:
-                    experiments.append({
-                        "network_scenarios": net,
-                        "cpu_quota": cpu,
-                        "threads": t,
-                        "chunk_size": c,
-                        "file_size_mb": 300,
-                        "exp_type": "probe_large",
-                        "nano_cpus": int(cpu * 1e9),
-                        "priority": 3,
-                        "bandwidth_mbps": net.get('mbps', 1000)
-                    })
-    
+
+        # ==========================
+        # 3️⃣ Probe Small 极端点
+        # IoT 和 Cloud / 弱网/高速网小文件测试
+        # ==========================
+        for net_probe in [NETWORK_SCENARIOS[0], NETWORK_SCENARIOS[2]]:
+            for cpu in [0.5, 2.0]:
+                for t in [1, 16]:
+                    for c in [256*1024, 1024*1024]:
+                        experiments.append({
+                            "network_scenarios": net_probe,
+                            "cpu_quota": cpu,
+                            "threads": t,
+                            "chunk_size": c,
+                            "file_size_mb": 10,
+                            "exp_type": "probe_small",
+                            "nano_cpus": int(cpu * 1e9),
+                            "priority": 2,
+                            "bandwidth_mbps": net_probe.get('mbps', 1000)
+                        })
+
+        # ==========================
+        # 4️⃣ Probe Large 极端点
+        # 排除 IoT, 测大文件+高并发
+        # ==========================
+        for net_probe in [NETWORK_SCENARIOS[1], NETWORK_SCENARIOS[2]]:
+            for cpu in [0.5, 1.0, 2.0]:
+                for t in [4, 8, 16]:
+                    for c in [1024*1024, 4*1024*1024]:
+                        experiments.append({
+                            "network_scenarios": net_probe,
+                            "cpu_quota": cpu,
+                            "threads": t,
+                            "chunk_size": c,
+                            "file_size_mb": 300,
+                            "exp_type": "probe_large",
+                            "nano_cpus": int(cpu * 1e9),
+                            "priority": 3,
+                            "bandwidth_mbps": net_probe.get('mbps', 1000)
+                        })
+
+    # ==========================
+    # 5️⃣ 排序，保证 priority 先行
+    # ==========================
     experiments.sort(key=lambda x: x['priority'])
+    print(f"✅ Total Experiments Generated: {len(experiments)}")
     return experiments
+
+
+# ==============================
+# 超时计算函数
+# ==============================
+def calculate_timeout(file_size_mb, bandwidth_mbps, threads=1):
+    if bandwidth_mbps <= 0: bandwidth_mbps = 1000
+    base_time = (file_size_mb * 8) / bandwidth_mbps
+
+    # 弱网 15x, 强网 5x
+    multiplier = 15 if bandwidth_mbps <= 5 else 5
+
+    timeout = max(60, min(base_time * multiplier, 3600))
+    print(f"[DEBUG] Timeout Calc: {file_size_mb}MB @ {bandwidth_mbps}Mbps x{multiplier} -> Limit {int(timeout)}s")
+    return int(timeout)
 
 # ==============================
 # 8. 单次实验执行
@@ -583,13 +623,6 @@ def exec_with_timeout(container, command, timeout_sec):
             print(f"   ❌ Client error: {e}")
             return -1, b"ERROR"
 
-def calculate_timeout(file_size_mb, bandwidth_mbps, threads=1):
-    if bandwidth_mbps <= 0:
-        bandwidth_mbps = 1000
-    base_time = (file_size_mb * 8) / bandwidth_mbps
-    estimated_time = base_time * 3  # 3x 安全系数
-    timeout = max(60, min(estimated_time, 1200))
-    return int(timeout)
 
 def run_single_experiment(client, config, run_id):
     net_cfg = config["network_scenarios"]
