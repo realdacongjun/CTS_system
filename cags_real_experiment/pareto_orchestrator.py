@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 CTS Pareto Optimization Orchestrator - Production Grade with Multi-Scale Sampling
-物理正确性：netnsid 定位 + Quota-Aware CPU + 隔离 IFB + 10/100/300MB 分层采样
+物理正确性：netnsid 定位 + Quota-Aware CPU + 隔离 IFB + 10/100/300MB 分层采样 + 动态超时
 """
 import docker
 import subprocess
@@ -19,6 +19,7 @@ from typing import List, Dict, Any
 import socket
 import struct
 import glob
+import concurrent.futures
 
 # ==============================
 # 1. 配置区
@@ -29,9 +30,9 @@ CLIENT_IMAGE = "python:3.9-slim"
 DATA_FILE = "/tmp/cts_test_file_300mb.dat"  # 生成最大300MB，通过Range读取不同部分
 
 NETWORK_SCENARIOS = [
-    {"name": "IoT_Weak", "bw": "2mbit", "delay": "400ms", "loss": "5%"},
-    {"name": "Edge_Normal", "bw": "20mbit", "delay": "100ms", "loss": "1%"},
-    {"name": "Cloud_Fast", "bw": "1000mbit", "delay": "5ms", "loss": "0%"}
+    {"name": "IoT_Weak", "bw": "2mbit", "delay": "400ms", "loss": "5%", "mbps": 2},
+    {"name": "Edge_Normal", "bw": "20mbit", "delay": "100ms", "loss": "1%", "mbps": 20},
+    {"name": "Cloud_Fast", "bw": "1000mbit", "delay": "5ms", "loss": "0%", "mbps": 1000}
 ]
 
 # ==============================
@@ -79,186 +80,44 @@ def prepare_test_file(max_size_mb=300):
 # 3. VETH 定位（内核原教旨）
 # ==============================
 
-
-
-def get_veth_kernel_native(container_id, timeout=60):
+def get_veth_kernel_native(container_id, timeout=30):
     """
-    稳定获取 veth：等待 netns 就绪 -> 等待 eth0 UP -> 解析 ifindex -> MAC fallback
-    修复：Docker 异步网络创建导致的 /proc/<pid>/ns/net 不存在问题
+    [最终修复版] 利用 VETH 对等原理定位接口
+    原理：容器内 eth0 的 iflink 值 === 宿主机 veth 的 ifindex 值
     """
     start = time.time()
-    client = docker.from_env()
+    pid = None
     
-    # =================== 阶段 0: 获取 container 对象和 PID ===================
+    # 1. 等待容器 PID 就绪 (Docker 层面)
     while time.time() - start < timeout:
         try:
-            container = client.containers.get(container_id)
-            info = container.attrs
-            
-            if not info['State']['Running']:
-                if info['State']['ExitCode'] != 0:
-                    logs = container.logs(tail=50).decode('utf-8', errors='ignore')
-                    raise RuntimeError(f"Container exited ({info['State']['ExitCode']}). Logs: {logs}")
-                time.sleep(0.2)
-                continue
-            
-            pid = info['State']['Pid']
-            if pid and pid != 0:
-                break
-                
-        except docker.errors.NotFound:
-            raise RuntimeError(f"Container {container_id} not found")
-        except Exception as e:
-            if "exited" in str(e):
-                raise
-            time.sleep(0.2)
-    else:
-        raise RuntimeError("Timeout: Container did not start")
-
-    print(f"   [DEBUG] Container {container_id[:12]} PID: {pid}")
-
-    # =================== 阶段 1: 关键修复 - 等待 netns 文件出现 ===================
-    netns_path = f"/proc/{pid}/ns/net"
-    ns_start = time.time()
-    
-    while time.time() - ns_start < timeout:
-        if os.path.exists(netns_path):
-            print(f"   [DEBUG] Netns ready: {netns_path}")
-            break
-        print(f"   [WAIT] Netns not ready yet: {netns_path}...")
+            pid = sh(f"docker inspect -f '{{{{.State.Pid}}}}' {container_id}")
+            if pid and pid != '0': break
+        except: pass
         time.sleep(0.5)
-    else:
-        # 最后检查：如果仍不存在，检查容器是否还在运行
-        container.reload()
-        if not container.attrs['State']['Running']:
-            raise RuntimeError(f"Container died while waiting for netns. Exit code: {container.attrs['State']['ExitCode']}")
-        raise RuntimeError(f"Timeout: {netns_path} not created after {timeout}s")
+        
+    if not pid:
+        raise RuntimeError(f"Container {container_id[:12]} failed to start (No PID)")
 
-    # =================== 阶段 2: 等待 eth0 出现并 UP ===================
-    eth0_start = time.time()
-    peer_ifindex = None
-    
-    while time.time() - eth0_start < timeout:
+    # 2. 循环重试：等待网络命名空间就绪
+    for i in range(40): # 20秒超时
         try:
-            # 双重检查 netns 仍存在（防止容器突然退出）
-            if not os.path.exists(netns_path):
-                raise RuntimeError("Netns disappeared during check")
+            peer_idx = sh(f"nsenter -t {pid} -n cat /sys/class/net/eth0/iflink")
             
-            # 使用 nsenter 检查 eth0 状态
-            link_output = sh(f"nsenter -t {pid} -n ip link show eth0 2>&1", check=False)
-            
-            # eth0 还不存在
-            if "does not exist" in link_output:
-                print(f"   [WAIT] eth0 not created yet...")
-                time.sleep(0.5)
-                continue
-            
-            # eth0 存在但未 UP（网络配置中）
-            if "state UP" not in link_output:
-                print(f"   [WAIT] eth0 exists but not UP: {link_output[:60].strip()}...")
-                time.sleep(0.3)
-                continue
-            
-            # eth0 UP - 提取 peer ifindex
-            match = re.search(r'eth0@if(\d+)', link_output)
-            if match:
-                peer_ifindex = match.group(1)
-                print(f"   [DEBUG] eth0 UP, peer ifindex: {peer_ifindex}")
-                break
-            else:
-                # 老内核可能没有 @if 格式，尝试备选解析
-                print(f"   [WARN] Could not parse eth0@ifXXXX from: {link_output[:100]}")
-                time.sleep(0.5)
+            if peer_idx and peer_idx.isdigit():
+                host_line = sh(f"ip -o link show | grep '^{peer_idx}:'")
                 
-        except Exception as e:
-            print(f"   [WARN] nsenter check failed: {e}")
-            time.sleep(0.5)
-    
-    if not peer_ifindex:
-        print("   [WARN] eth0 timeout, attempting MAC fallback...")
-        return get_veth_by_mac(container_id, pid, timeout=15)
+                if host_line:
+                    parts = host_line.split(':')[1].strip().split('@')[0]
+                    return parts
+                    
+        except Exception:
+            pass 
 
-    # =================== 阶段 3: 在宿主机查找 veth ===================
-    try:
-        # 方法 A: 通过 ip link 直接查找（最快）
-        result = sh(f"ip -o link show | grep '^{peer_ifindex}:' | head -1", check=False)
-        if result:
-            # 格式: "1044: vethXXXXX@if1043: <BROADCAST,MULTICAST,UP,LOWER_UP>..."
-            match = re.match(r'\d+:\s+([^\s:@]+)', result)
-            if match and 'veth' in match.group(1):
-                veth_name = match.group(1)
-                print(f"   [OK] Found veth via ip link: {veth_name}")
-                return veth_name
-        
-        # 方法 B: 扫描 /sys/class/net（更可靠，但慢）
-        for iface in os.listdir('/sys/class/net/'):
-            if not iface.startswith('veth'):
-                continue
-            try:
-                with open(f'/sys/class/net/{iface}/iflink', 'r') as f:
-                    if f.read().strip() == peer_ifindex:
-                        print(f"   [OK] Found veth via sysfs: {iface}")
-                        return iface
-            except:
-                continue
-        
-        # 方法 C: 通过 bridge fdb + MAC（最后手段）
-        print("   [WARN] ifindex methods failed, trying bridge fdb...")
-        mac = sh(f"docker inspect -f '{{{{range .NetworkSettings.Networks}}}}{{{{.MacAddress}}}}{{{{end}}}}' {container_id}").lower().strip()
-        if mac:
-            for _ in range(10):
-                fdb = sh(f"bridge fdb show | grep -i '{mac}' | grep 'veth' | head -1", check=False)
-                if fdb:
-                    parts = fdb.split()
-                    for i, p in enumerate(parts):
-                        if p == 'dev' and i+1 < len(parts):
-                            veth_name = parts[i+1]
-                            print(f"   [OK] Found veth via bridge fdb: {veth_name}")
-                            return veth_name
-                time.sleep(0.2)
-                
-    except Exception as e:
-        print(f"   [ERROR] Find veth failed: {e}")
-    
-    raise RuntimeError(f"All veth detection methods failed for {container_id[:12]}")
+        time.sleep(0.5)
 
-
-def get_veth_by_mac(container_id, pid, timeout=10):
-    """
-    备选方案：通过 MAC 地址在 bridge fdb 中查找
-    """
-    try:
-        # 获取容器 MAC
-        mac = sh(f"docker inspect -f '{{{{range .NetworkSettings.Networks}}}}{{{{.MacAddress}}}}{{{{end}}}}' {container_id}").lower().strip()
-        print(f"   [DEBUG] MAC fallback: {mac}")
-        
-        if not mac:
-            raise RuntimeError("Cannot get MAC")
-        
-        for _ in range(timeout * 2):  # 20 次尝试
-            try:
-                # 在 bridge fdb 中查找
-                fdb = sh(f"bridge fdb show | grep -i '{mac}' | head -1", check=False)
-                if fdb and 'veth' in fdb:
-                    parts = fdb.split()
-                    for i, p in enumerate(parts):
-                        if p == 'dev' and i+1 < len(parts):
-                            candidate = parts[i+1]
-                            print(f"   [OK] Found veth by MAC: {candidate}")
-                            return candidate
-            except:
-                pass
-            time.sleep(0.5)
-            
-    except Exception as e:
-        print(f"   [ERROR] MAC fallback failed: {e}")
-    
-    raise RuntimeError("All veth detection methods failed")
-
-# 确保文件顶部有:
-# import re
-# import os
-
+    debug_log = sh(f"nsenter -t {pid} -n ip addr")
+    raise RuntimeError(f"VETH lookup failed for {container_id[:12]} (PID={pid}). Inner Net:\n{debug_log}")
 
 # ==============================
 # 4. TC 配置（完全隔离 IFB）
@@ -268,19 +127,15 @@ def setup_isolated_tc(veth, bw, delay, loss, run_id):
     """每次实验使用独立命名的 ifb 设备"""
     ifb_name = f"ifb_{run_id}_{int(time.time()*1000)%1000}"
     
-    # 清理旧规则
     sh(f"tc qdisc del dev {veth} root 2>/dev/null", check=False)
     sh(f"tc qdisc del dev {veth} ingress 2>/dev/null", check=False)
     
-    # 创建独立 ifb
     sh(f"modprobe ifb numifbs=100", check=False)
     sh(f"ip link add {ifb_name} type ifb", check=False)
     sh(f"ip link set {ifb_name} up", check=False)
     
-    # Egress (Server -> Client)
     sh(f"tc qdisc add dev {veth} root netem delay {delay} loss {loss} rate {bw}")
     
-    # Ingress (Client -> Server) via IFB
     sh(f"tc qdisc add dev {veth} ingress")
     sh(f"tc filter add dev {veth} parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev {ifb_name}")
     sh(f"tc qdisc add dev {ifb_name} root netem delay {delay} loss {loss} rate {bw}")
@@ -297,7 +152,6 @@ def reset_isolated_tc(veth, ifb_name):
         sh(f"ip link del {ifb_name} 2>/dev/null", check=False)
 
 def get_tc_stats(veth, ifb_name):
-    """获取 tc 统计（验证实际丢包、延迟）"""
     stats = {}
     try:
         if veth:
@@ -309,7 +163,7 @@ def get_tc_stats(veth, ifb_name):
     return stats
 
 # ==============================
-# 5. 物理正确的 CPU 监控（已修正公式）
+# 5. 物理正确的 CPU 监控（已修正公式 + 绝对CPU时间）
 # ==============================
 
 class PhysicalCPUMonitor:
@@ -320,66 +174,81 @@ class PhysicalCPUMonitor:
         self.prev = None
         self.data = []
         self.running = False
-        self._df_result = None  # 缓存避免重复 stop
+        self._df_result = None
+        # ✅ 新增：精确累积量（纳秒）
+        self.start_ns = 0
+        self.end_ns = 0
         
+    def _read_total_ns(self):
+        """直接获取 Cgroup 原始累计值 (纳秒)"""
+        try:
+            stats = self.container.stats(stream=False)
+            return stats['cpu_stats']['cpu_usage']['total_usage']
+        except:
+            return 0
+
     def sample(self):
+        """采样瞬时利用率（用于微观CSV记录）"""
         try:
             stats = self.container.stats(stream=False)
             cgroup_stats = stats.get('cpu_stats', {})
-            
             cpu_usage = cgroup_stats.get('cpu_usage', {}).get('total_usage', 0)
             system_usage = cgroup_stats.get('system_cpu_usage', 0)
-            
             throttling = cgroup_stats.get('throttling_data', {})
-            periods = throttling.get('periods', 0)
-            throttled_periods = throttling.get('throttled_periods', 0)
             
             if self.prev:
                 cpu_delta = cpu_usage - self.prev['cpu_usage']
                 sys_delta = system_usage - self.prev['system_usage']
                 
                 if sys_delta > 0:
-                    # 物理正确公式：相对于配额的使用率
                     cpu_percent = (cpu_delta / sys_delta) * self.host_cores / self.quota_cores * 100
                     cpu_percent = min(cpu_percent, 100.0)
                 else:
-                    cpu_percent = 0
+                    cpu_percent = 0.0
                 
-                throttle_ratio = throttled_periods / max(periods, 1)
+                throttle_ratio = throttling.get('throttled_periods', 0) / max(throttling.get('periods', 0), 1)
                 
                 self.data.append({
                     'timestamp': time.time(),
                     'cpu_percent': round(cpu_percent, 2),
                     'throttle_ratio': round(throttle_ratio, 4),
-                    'throttled_periods': throttled_periods
+                    'throttled_periods': throttling.get('throttled_periods', 0)
                 })
             
-            self.prev = {
-                'cpu_usage': cpu_usage,
-                'system_usage': system_usage
-            }
+            self.prev = {'cpu_usage': cpu_usage, 'system_usage': system_usage}
         except:
             pass
     
     def start(self):
+        # ✅ 记录起始 CPU 时间
+        self.start_ns = self._read_total_ns()
         self.running = True
         def loop():
             while self.running:
                 self.sample()
-                time.sleep(0.5)
+                time.sleep(0.1)  # 提高到 10Hz 采样率，更准确
         self.thread = threading.Thread(target=loop, daemon=True)
         self.thread.start()
     
     def stop(self):
         """返回 DataFrame，重复调用返回缓存"""
-        if self._df_result is not None:
+        if self._df_result is not None: 
             return self._df_result
             
         self.running = False
         if self.thread:
             self.thread.join(timeout=2)
+        
+        # ✅ 记录结束 CPU 时间
+        self.end_ns = self._read_total_ns()
         self._df_result = pd.DataFrame(self.data)
         return self._df_result
+
+    def get_total_cpu_seconds(self):
+        """✅ 获取整个任务期间消耗的 CPU 绝对时间 (秒)"""
+        if self.end_ns and self.start_ns and self.end_ns > self.start_ns:
+            return (self.end_ns - self.start_ns) / 1e9
+        return 0.000001
 
 @contextmanager
 def physical_monitor(container, nano_cpus_quota):
@@ -426,32 +295,41 @@ def wait_for_network_steady_syn_only(server_ip, port=80, timeout=10):
     return False
 
 # ==============================
-# 7. 分层采样实验生成器（恢复 10/100/300MB）
+# 7. 分层采样实验生成器（调整文件大小避免超时）
 # ==============================
 
+def get_adjusted_file_size(net_name, base_size):
+    """
+    ✅ 根据网络带宽调整文件大小，避免慢网场景超时：
+    - IoT_Weak (2mbit): 最大 10MB（约 40s 传输时间）
+    - Edge_Normal (20mbit): 最大 50MB（约 20s 传输时间）
+    - Cloud_Fast (1gbit): 保持 100MB（约 1s 传输时间）
+    """
+    if "IoT" in net_name or "Weak" in net_name:
+        return min(base_size, 10)
+    elif "Edge" in net_name:
+        return min(base_size, 50)
+    else:  # Cloud/Fast
+        return base_size
+
 def generate_hierarchical_experiments() -> List[Dict[str, Any]]:
-    """
-    分层采样策略：
-    - 10MB (Probe Small): 稀疏采样，验证小文件适应性
-    - 100MB (Anchor): 全因子采样，核心帕累托前沿
-    - 300MB (Probe Large): 稀疏采样，验证长时间稳定性（跳过IoT_Weak避免20分钟/次）
-    """
     experiments = []
     
-    # ==============================
-    # Layer 1: Anchor (100MB) - 全因子
-    # 3网络 × 3CPU × 5线程 × 3块大小 = 135次
-    # ==============================
-    print("🎯 Layer 1: Anchor experiments (100MB, full-factorial)")
+    # 1. Anchor Layer (自适应大小)
+    print("🎯 Layer 1: Anchor experiments (自适应大小, full-factorial)")
     for net in NETWORK_SCENARIOS:
-        # 100MB 基线（无TC）
+        adj_size = get_adjusted_file_size(net['name'], 100)
+        
+        # 基线
         experiments.append({
             "network_scenarios": {"name": f"{net['name']}_BASELINE", "bw": "unlimited", "delay": "0ms", "loss": "0%"},
-            "cpu_quota": 1.0, "threads": 4, "chunk_size": 1024*1024, "file_size_mb": 100,
-            "exp_type": "anchor_baseline", "nano_cpus": int(1e9), "priority": 1
+            "cpu_quota": 1.0, "threads": 4, "chunk_size": 1024*1024, 
+            "file_size_mb": adj_size, "priority": 1, "nano_cpus": int(1e9),
+            "exp_type": "anchor_baseline",
+            "bandwidth_mbps": net.get('mbps', 1000)
         })
         
-        # 100MB 全因子实验
+        # 全因子
         for cpu in [0.5, 1.0, 2.0]:
             for t in [1, 2, 4, 8, 16]:
                 for c in [256*1024, 1024*1024, 4*1024*1024]:
@@ -460,30 +338,20 @@ def generate_hierarchical_experiments() -> List[Dict[str, Any]]:
                         "cpu_quota": cpu,
                         "threads": t,
                         "chunk_size": c,
-                        "file_size_mb": 100,
+                        "file_size_mb": adj_size,
                         "exp_type": "anchor",
                         "nano_cpus": int(cpu * 1e9),
-                        "priority": 1
+                        "priority": 1,
+                        "bandwidth_mbps": net.get('mbps', 1000)
                     })
-        
-        # 100MB 验证基线
-        experiments.append({
-            "network_scenarios": {"name": f"{net['name']}_VERIFY", "bw": "unlimited", "delay": "0ms", "loss": "0%"},
-            "cpu_quota": 1.0, "threads": 4, "chunk_size": 1024*1024, "file_size_mb": 100,
-            "exp_type": "anchor_verify", "nano_cpus": int(1e9), "priority": 1
-        })
     
-    # ==============================
-    # Layer 2: Probe Small (10MB) - 稀疏采样
-    # 仅边界条件：Weak/Fast × 低/高CPU × 极端线程 × 小Chunk
-    # 2网络 × 2CPU × 2线程 × 2块大小 = 16次
-    # ==============================
+    # 2. Probe Small (10MB)
     print("🧪 Layer 2: Probe small (10MB, sparse)")
-    probe_small_nets = [NETWORK_SCENARIOS[0], NETWORK_SCENARIOS[2]]  # IoT_Weak, Cloud_Fast
+    probe_small_nets = [NETWORK_SCENARIOS[0], NETWORK_SCENARIOS[2]]
     for net in probe_small_nets:
-        for cpu in [0.5, 2.0]:  # 仅边界CPU
-            for t in [1, 16]:   # 单线程 vs 激进多线程
-                for c in [256*1024, 1024*1024]:  # 小文件不用4MB chunk
+        for cpu in [0.5, 2.0]:
+            for t in [1, 16]:
+                for c in [256*1024, 1024*1024]:
                     experiments.append({
                         "network_scenarios": net,
                         "cpu_quota": cpu,
@@ -492,20 +360,17 @@ def generate_hierarchical_experiments() -> List[Dict[str, Any]]:
                         "file_size_mb": 10,
                         "exp_type": "probe_small",
                         "nano_cpus": int(cpu * 1e9),
-                        "priority": 2
+                        "priority": 2,
+                        "bandwidth_mbps": net.get('mbps', 1000)
                     })
     
-    # ==============================
-    # Layer 3: Probe Large (300MB) - 稀疏采样
-    # 排除 IoT_Weak（避免 20分钟/次），仅 Edge/Cloud
-    # 2网络 × 3CPU × 3线程 × 2块大小 = 36次
-    # ==============================
+    # 3. Probe Large (300MB)
     print("🔬 Layer 3: Probe large (300MB, sparse, skip IoT_Weak)")
-    probe_large_nets = [NETWORK_SCENARIOS[1], NETWORK_SCENARIOS[2]]  # Edge_Normal, Cloud_Fast
+    probe_large_nets = [NETWORK_SCENARIOS[1], NETWORK_SCENARIOS[2]]
     for net in probe_large_nets:
         for cpu in [0.5, 1.0, 2.0]:
-            for t in [4, 8, 16]:  # 仅中高线程（低线程大文件无风险）
-                for c in [1024*1024, 4*1024*1024]:  # 大文件用大 chunk
+            for t in [4, 8, 16]:
+                for c in [1024*1024, 4*1024*1024]:
                     experiments.append({
                         "network_scenarios": net,
                         "cpu_quota": cpu,
@@ -514,40 +379,62 @@ def generate_hierarchical_experiments() -> List[Dict[str, Any]]:
                         "file_size_mb": 300,
                         "exp_type": "probe_large",
                         "nano_cpus": int(cpu * 1e9),
-                        "priority": 3
+                        "priority": 3,
+                        "bandwidth_mbps": net.get('mbps', 1000)
                     })
     
-    # 按优先级排序（Anchor先跑）
     experiments.sort(key=lambda x: x['priority'])
-    
-    # 统计
-    counts = {
-        'anchor': len([e for e in experiments if e['exp_type'] == 'anchor']),
-        'anchor_baseline': len([e for e in experiments if 'baseline' in e['exp_type']]),
-        'probe_small': len([e for e in experiments if e['exp_type'] == 'probe_small']),
-        'probe_large': len([e for e in experiments if e['exp_type'] == 'probe_large'])
-    }
-    total = len(experiments)
-    
-    print(f"\n📊 分层实验设计:")
-    print(f"   ⚓ Anchor (100MB):      {counts['anchor']:3d} 次 (全因子) + {counts['anchor_baseline']:2d} 基线")
-    print(f"   🧪 Probe Small (10MB):  {counts['probe_small']:3d} 次 (稀疏)")
-    print(f"   🔬 Probe Large (300MB): {counts['probe_large']:3d} 次 (稀疏, 无IoT_Weak)")
-    print(f"   ─────────────────────────")
-    print(f"   总计: {total} 次实验")
-    print(f"   预估时间: ~{total * 25 / 60:.1f} 小时 (按25秒/次)")
-    
     return experiments
 
 # ==============================
 # 8. 单次实验执行
 # ==============================
 
+def exec_with_timeout(container, command, timeout_sec):
+    """✅ 适配 Docker SDK 的 exec_run 并添加超时"""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(container.exec_run, command)
+        try:
+            result = future.result(timeout=timeout_sec)
+            return result.exit_code, result.output
+        except concurrent.futures.TimeoutError:
+            print(f"   ❌ Client execution timeout ({timeout_sec}s)")
+            try:
+                container.kill()
+            except:
+                pass
+            return -1, b"TIMEOUT"
+        except Exception as e:
+            print(f"   ❌ Client execution error: {e}")
+            return -1, b"ERROR"
+
+def calculate_timeout(file_size_mb, bandwidth_mbps, threads=1):
+    """
+    
+    ✅ 根据带宽和文件大小动态计算 timeout：
+    - 基础传输时间 = file_size_mb * 8 / bandwidth_mbps
+    - 考虑 TCP 慢启动和重传，乘以系数 3
+    - 最小 60s，最大 1200s（20分钟）
+    """
+    if bandwidth_mbps <= 0:
+        bandwidth_mbps = 1000  # 默认 Cloud
+    
+    base_time = (file_size_mb * 8) / bandwidth_mbps  # 理论秒数
+    estimated_time = base_time * 3  # 安全系数 3x
+    
+    timeout = max(60, min(estimated_time, 1200))
+    return int(timeout)
+
 def run_single_experiment(client, config, run_id):
+    """
+    
+    """
     net_cfg = config["network_scenarios"]
     exp_type = config["exp_type"]
     file_size = config["file_size_mb"]
     is_baseline = "baseline" in exp_type or config.get("is_baseline", False)
+    # ✅ 修正语法错误
+    bandwidth_mbps = config.get("bandwidth_mbps", 1000)
     
     type_marker = {"anchor_baseline": "📏", "anchor": "⚓", "anchor_verify": "✓", 
                    "probe_small": "🧪", "probe_large": "🔬"}.get(exp_type, "○")
@@ -567,7 +454,6 @@ def run_single_experiment(client, config, run_id):
         # 1. Server
         short_id = f"{run_id}_{int(time.time()*1000)%10000}"
         
-        # ✅ 修复：正确的 Nginx 配置（注意 location / 有空格）
         nginx_conf = """events {
     worker_connections 1024;
 }
@@ -577,7 +463,6 @@ http {
     client_max_body_size 500M;
     proxy_read_timeout 600s;
     send_timeout 600s;
-    
     server {
         listen 80;
         root /usr/share/nginx/html;
@@ -588,46 +473,32 @@ http {
     }
 }"""
         
-        conf_path = "/tmp/nginx.conf"
-        with open(conf_path, "w") as f:
+        with open("/tmp/nginx.conf", "w") as f:
             f.write(nginx_conf)
         
         server_c = client.containers.run(
             SERVER_IMAGE, name=f"srv_{short_id}", detach=True, network=NETWORK_NAME,
             volumes={DATA_FILE: {"bind": "/usr/share/nginx/html/data.bin", "mode": "ro"},
-                     conf_path: {"bind": "/etc/nginx/nginx.conf", "mode": "ro"}},
+                     "/tmp/nginx.conf": {"bind": "/etc/nginx/nginx.conf", "mode": "ro"}},
             command="nginx -g 'daemon off;'"
         )
         
-        # ✅ 新增：检查容器是否存活（防止配置错误导致 silent fail）
-        time.sleep(1)  # 给 Docker 启动时间
-        server_c.reload()
-        if server_c.status != 'running':
-            logs = server_c.logs().decode('utf-8', errors='ignore')
-            print(f"   [ERROR] Server failed to start: {logs}")
-            return None
-        
-        # 2. VETH（此时容器肯定存活）
+        # 2. VETH
         veth = get_veth_kernel_native(server_c.id)
-        print(f"   🌐 {veth}")
         
-        
-        # 3. TC 配置（基线不加 TC）
+        # 3. TC
         if not is_baseline:
             ifb_name = setup_isolated_tc(veth, net_cfg['bw'], net_cfg['delay'], net_cfg['loss'], run_id)
         else:
             ifb_name = None
             sh(f"tc qdisc del dev {veth} root 2>/dev/null", check=False)
         
-        # 4. 网络稳态
+        # 4. Network Ready
         server_ip = client.api.inspect_container(server_c.id)["NetworkSettings"]["Networks"][NETWORK_NAME]["IPAddress"]
         wait_for_network_steady_syn_only(server_ip)
         
-
-
-        # 5. Client - 创建后验证 Python 环境和脚本
-        script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "pareto_client.py"))
-        
+        # 5. Client
+        script_path = os.path.join(os.path.dirname(__file__), "pareto_client.py")
         client_c = client.containers.run(
             CLIENT_IMAGE, name=f"cli_{short_id}", detach=True, network=NETWORK_NAME,
             nano_cpus=config["nano_cpus"], mem_limit="512m",
@@ -635,83 +506,40 @@ http {
             command="sleep 3600"
         )
         
-        # ✅ 关键验证：确保 Python 和脚本可用
-        time.sleep(0.5)
-        check_cmd = "python3 --version && ls -la /app/client.py"
-        check_res = client_c.exec_run(check_cmd)
-        print(f"   [DEBUG] Client env check: {check_res.output.decode('utf-8', errors='ignore').strip()}")
-        
-        if check_res.exit_code != 0:
-            print(f"   [ERROR] Client environment check failed!")
-            return None
-        
-        
-        # 6. 执行（物理监控）- 修复 Docker SDK 7.x 兼容性和超时
-        import concurrent.futures
+        # 6. Execute with Monitor
         with physical_monitor(client_c, config["nano_cpus"]) as mon:
             chunk_mb = config["chunk_size"] / (1024*1024)
             cmd = (f"python3 /app/client.py --url http://{server_ip}/data.bin "
                    f"--threads {config['threads']} --size {file_size} --buffer {chunk_mb}")
             
-            print(f"   [DEBUG] Executing: {cmd[:80]}...")
-            
-            # Docker SDK 7.x 兼容 + 超时处理
-            def exec_with_timeout(container, command, timeout_sec):
-                """适配 Docker SDK 7.x 的 exec_run 并添加超时"""
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(container.exec_run, command)
-                    try:
-                        result = future.result(timeout=timeout_sec)
-                        # Docker 7.x 返回 ExecResult 对象，有 exit_code 和 output 属性
-                        return result.exit_code, result.output
-                    except concurrent.futures.TimeoutError:
-                        print(f"   ❌ Client execution timeout ({timeout_sec}s)")
-                        try:
-                            container.kill()  # 强制停止卡住的客户觓
-                        except:
-                            pass
-                        return -1, b"TIMEOUT"
-                    except Exception as e:
-                        print(f"   ❌ Client execution error: {e}")
-                        return -1, b"ERROR"
-            
-            timeout_seconds = 600 if file_size == 300 else 300
             t0 = time.perf_counter()
-            exit_code, output = exec_with_timeout(client_c, cmd, timeout_seconds)
+            # ✅ 计算动态超时
+            timeout_val = calculate_timeout(file_size, bandwidth_mbps)
+            # ✅ 使用并发执行器（防止 Docker SDK 阻塞）
+            exit_code, output = exec_with_timeout(client_c, cmd, timeout_val)
             duration = time.perf_counter() - t0
             
-            # 调试输出
-            output_str = output.decode("utf-8", errors="ignore")
-            print(f"   [DEBUG] Exit code: {exit_code}, Duration: {duration:.2f}s")
-            if len(output_str) > 0:
-                print(f"   [DEBUG] Output last 200 chars: ...{output_str[-200:]}")
-            
-            # 解析 JSON（增强版）
             client_res = {}
-            if exit_code == 0 and output_str:
-                json_lines = [line.strip() for line in output_str.split('\n') 
-                             if line.strip().startswith('{') and line.strip().endswith('}')]
-                for line in reversed(json_lines):  # 从最后一行开始找
-                    try:
-                        client_res = json.loads(line)
-                        print(f"   [DEBUG] Got throughput: {client_res.get('throughput_mbps', 'N/A')} Mbps")
-                        break
-                    except json.JSONDecodeError:
-                        continue
-            
-            if not client_res:
-                print(f"   [WARN] Failed to parse result, output was: {output_str[:200]}...")
+            for line in reversed(output.decode("utf-8", errors="ignore").strip().split("\n")):
+                if line.startswith("{") and line.endswith("}"):
+                    try: client_res = json.loads(line); break
+                    except: pass
             
             df_micro = mon.stop()
-
         
         if exit_code not in [0, 2]:
             print(f"   ❌ Client failed: {exit_code}")
             return None
         
+        # 7. Stats
+        total_cpu_s = mon.get_total_cpu_seconds()
         avg_cpu = df_micro["cpu_percent"].mean() if not df_micro.empty else 0
         max_throttle = df_micro["throttle_ratio"].max() if not df_micro.empty else 0
         thr = client_res.get("throughput_mbps", 0)
+        
+        efficiency_data = file_size / total_cpu_s if total_cpu_s > 1e-6 else 0
+        efficiency_mbps_per_cpu = thr / total_cpu_s if total_cpu_s > 1e-6 and thr > 0 else 0
+        cost_cpu_seconds = total_cpu_s
         
         tc_stats = get_tc_stats(veth, ifb_name) if not is_baseline else {}
         
@@ -725,6 +553,9 @@ http {
             "chunk_kb": config["chunk_size"]//1024,
             "duration_s": round(duration, 3),
             "throughput_mbps": round(thr, 2),
+            "cost_cpu_seconds": round(cost_cpu_seconds, 6),
+            "efficiency_mb_per_cpus": round(efficiency_data, 2),
+            "efficiency_mbps_per_cpu": round(efficiency_mbps_per_cpu, 2),
             "avg_cpu_pct": round(avg_cpu, 2),
             "max_throttle_ratio": round(max_throttle, 4),
             "kernel_rtt_ms": round(client_res.get("rtt_ms", -1), 2),
@@ -733,12 +564,8 @@ http {
         }
         
         status = "📏 BASELINE" if is_baseline else "✅"
-        print(f"   {status} Thr:{result['throughput_mbps']:6.1f}Mbps | CPU:{result['avg_cpu_pct']:5.1f}%")
+        print(f"   {status} Thr:{thr:6.1f}Mbps | Cost:{cost_cpu_seconds:.4f}s | Eff:{efficiency_data:.1f}MB/s")
         
-        if not is_baseline and veth and ifb_name:
-            reset_isolated_tc(veth, ifb_name)
-            veth, ifb_name = None, None
-            
         return result
         
     except Exception as e:
@@ -779,7 +606,7 @@ def main():
     prepare_test_file(300)
     experiments = generate_hierarchical_experiments()
     
-    # 同优先级内混洗（避免时间漂移）
+    # 同优先级内混洗
     import random
     random.seed(42)
     for p in [1, 2, 3]:
@@ -811,7 +638,6 @@ def main():
     
     print(f"\n✅ Completed: {len(results)}/{len(experiments)}")
     
-    # 多尺度分析
     try:
         df = pd.DataFrame(results)
         print("\n📊 Multi-Scale Analysis:")
