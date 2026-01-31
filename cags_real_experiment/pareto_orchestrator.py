@@ -2,6 +2,7 @@
 """
 CTS Pareto Optimization Orchestrator - Production Grade with Multi-Scale Sampling
 物理正确性：netnsid 定位 + Quota-Aware CPU + 隔离 IFB + 10/100/300MB 分层采样 + 动态超时
+修复：TC 限速验证 + Nginx 零拷贝禁用
 """
 import docker
 import subprocess
@@ -27,7 +28,7 @@ import concurrent.futures
 NETWORK_NAME = "cts_exp_net"
 SERVER_IMAGE = "nginx:alpine"
 CLIENT_IMAGE = "python:3.9-slim"
-DATA_FILE = "/tmp/cts_test_file_300mb.dat"  # 生成最大300MB，通过Range读取不同部分
+DATA_FILE = "/tmp/cts_test_file_300mb.dat"
 
 NETWORK_SCENARIOS = [
     {"name": "IoT_Weak", "bw": "2mbit", "delay": "400ms", "loss": "5%", "mbps": 2},
@@ -92,8 +93,10 @@ def get_veth_kernel_native(container_id, timeout=30):
     while time.time() - start < timeout:
         try:
             pid = sh(f"docker inspect -f '{{{{.State.Pid}}}}' {container_id}")
-            if pid and pid != '0': break
-        except: pass
+            if pid and pid != '0': 
+                break
+        except: 
+            pass
         time.sleep(0.5)
         
     if not pid:
@@ -102,44 +105,67 @@ def get_veth_kernel_native(container_id, timeout=30):
     # 2. 循环重试：等待网络命名空间就绪
     for i in range(40): # 20秒超时
         try:
-            peer_idx = sh(f"nsenter -t {pid} -n cat /sys/class/net/eth0/iflink")
+            # 关键修复：通过 nsenter 读取容器内的 iflink
+            peer_idx = sh(f"nsenter -t {pid} -n cat /sys/class/net/eth0/iflink 2>/dev/null")
             
             if peer_idx and peer_idx.isdigit():
-                host_line = sh(f"ip -o link show | grep '^{peer_idx}:'")
+                # 在宿主机上查找对应 ifindex 的 veth
+                host_line = sh(f"ip -o link show | grep '^{peer_idx}:' 2>/dev/null")
                 
                 if host_line:
-                    parts = host_line.split(':')[1].strip().split('@')[0]
-                    return parts
+                    # 解析接口名：格式 "1044: vethXXXXX@if1043: ..."
+                    parts = host_line.split(':')[1].strip().split('@')[0].split()
+                    if parts:
+                        return parts[0]
                     
         except Exception:
-            pass 
-
+            pass
         time.sleep(0.5)
 
-    debug_log = sh(f"nsenter -t {pid} -n ip addr")
-    raise RuntimeError(f"VETH lookup failed for {container_id[:12]} (PID={pid}). Inner Net:\n{debug_log}")
+    # 调试信息
+    debug_log = sh(f"nsenter -t {pid} -n ip addr 2>&1 || echo 'nsenter failed'")
+    raise RuntimeError(f"VETH lookup failed for {container_id[:12]} (PID={pid}). Debug: {debug_log}")
 
 # ==============================
-# 4. TC 配置（完全隔离 IFB）
+# 4. TC 配置（完全隔离 IFB）- 带验证
 # ==============================
 
 def setup_isolated_tc(veth, bw, delay, loss, run_id):
-    """每次实验使用独立命名的 ifb 设备"""
+    """
+    配置 TC 限速，带验证步骤确保生效
+    """
     ifb_name = f"ifb_{run_id}_{int(time.time()*1000)%1000}"
     
+    # 清理旧规则
     sh(f"tc qdisc del dev {veth} root 2>/dev/null", check=False)
     sh(f"tc qdisc del dev {veth} ingress 2>/dev/null", check=False)
     
+    # 创建独立 ifb
     sh(f"modprobe ifb numifbs=100", check=False)
     sh(f"ip link add {ifb_name} type ifb", check=False)
     sh(f"ip link set {ifb_name} up", check=False)
     
-    sh(f"tc qdisc add dev {veth} root netem delay {delay} loss {loss} rate {bw}")
+    # Egress (Server -> Client) - 关键限速规则
+    tc_cmd = f"tc qdisc add dev {veth} root netem delay {delay} loss {loss} rate {bw}"
+    result = sh(tc_cmd, check=False)
+    if result and "Error" in result:
+        raise RuntimeError(f"TC Egress failed: {result}")
     
-    sh(f"tc qdisc add dev {veth} ingress")
+    # Ingress (Client -> Server) via IFB
+    sh(f"tc qdisc add dev {veth} ingress", check=False)
     sh(f"tc filter add dev {veth} parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev {ifb_name}")
     sh(f"tc qdisc add dev {ifb_name} root netem delay {delay} loss {loss} rate {bw}")
     
+    # ✅ 关键验证：确认 TC 规则确实存在
+    verify = sh(f"tc qdisc show dev {veth} | grep netem", check=False)
+    if not verify or "netem" not in verify:
+        raise RuntimeError(f"TC 验证失败: 未在 {veth} 上找到 netem 规则")
+    
+    # 验证 rate 参数是否正确设置
+    if bw not in verify:
+        print(f"   [WARN] TC 验证警告: 期望带宽 {bw}, 实际: {verify[:100]}")
+    
+    print(f"   [DEBUG] TC configured on {veth}: {bw}, delay={delay}, loss={loss}")
     return ifb_name
 
 def reset_isolated_tc(veth, ifb_name):
@@ -163,7 +189,7 @@ def get_tc_stats(veth, ifb_name):
     return stats
 
 # ==============================
-# 5. 物理正确的 CPU 监控（已修正公式 + 绝对CPU时间）
+# 5. 物理正确的 CPU 监控
 # ==============================
 
 class PhysicalCPUMonitor:
@@ -175,7 +201,6 @@ class PhysicalCPUMonitor:
         self.data = []
         self.running = False
         self._df_result = None
-        # ✅ 新增：精确累积量（纳秒）
         self.start_ns = 0
         self.end_ns = 0
         
@@ -188,7 +213,6 @@ class PhysicalCPUMonitor:
             return 0
 
     def sample(self):
-        """采样瞬时利用率（用于微观CSV记录）"""
         try:
             stats = self.container.stats(stream=False)
             cgroup_stats = stats.get('cpu_stats', {})
@@ -220,32 +244,26 @@ class PhysicalCPUMonitor:
             pass
     
     def start(self):
-        # ✅ 记录起始 CPU 时间
         self.start_ns = self._read_total_ns()
         self.running = True
         def loop():
             while self.running:
                 self.sample()
-                time.sleep(0.1)  # 提高到 10Hz 采样率，更准确
+                time.sleep(0.1)
         self.thread = threading.Thread(target=loop, daemon=True)
         self.thread.start()
     
     def stop(self):
-        """返回 DataFrame，重复调用返回缓存"""
         if self._df_result is not None: 
             return self._df_result
-            
         self.running = False
         if self.thread:
             self.thread.join(timeout=2)
-        
-        # ✅ 记录结束 CPU 时间
         self.end_ns = self._read_total_ns()
         self._df_result = pd.DataFrame(self.data)
         return self._df_result
 
     def get_total_cpu_seconds(self):
-        """✅ 获取整个任务期间消耗的 CPU 绝对时间 (秒)"""
         if self.end_ns and self.start_ns and self.end_ns > self.start_ns:
             return (self.end_ns - self.start_ns) / 1e9
         return 0.000001
@@ -278,7 +296,6 @@ def wait_for_network_steady_syn_only(server_ip, port=80, timeout=10):
             sock.connect((server_ip, port))
             t1 = time.perf_counter()
             
-            # 立即 RST 避免 TIME_WAIT
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
             sock.close()
             
@@ -291,16 +308,15 @@ def wait_for_network_steady_syn_only(server_ip, port=80, timeout=10):
         except:
             pass
         time.sleep(0.3)
-    
     return False
 
 # ==============================
-# 7. 分层采样实验生成器（调整文件大小避免超时）
+# 7. 分层采样实验生成器
 # ==============================
 
 def get_adjusted_file_size(net_name, base_size):
     """
-    ✅ 根据网络带宽调整文件大小，避免慢网场景超时：
+    根据网络带宽调整文件大小，避免慢网场景超时：
     - IoT_Weak (2mbit): 最大 10MB（约 40s 传输时间）
     - Edge_Normal (20mbit): 最大 50MB（约 20s 传输时间）
     - Cloud_Fast (1gbit): 保持 100MB（约 1s 传输时间）
@@ -309,18 +325,17 @@ def get_adjusted_file_size(net_name, base_size):
         return min(base_size, 10)
     elif "Edge" in net_name:
         return min(base_size, 50)
-    else:  # Cloud/Fast
+    else:
         return base_size
 
 def generate_hierarchical_experiments() -> List[Dict[str, Any]]:
     experiments = []
     
-    # 1. Anchor Layer (自适应大小)
-    print("🎯 Layer 1: Anchor experiments (自适应大小, full-factorial)")
+    print("🎯 Layer 1: Anchor experiments (自适应大小)")
     for net in NETWORK_SCENARIOS:
         adj_size = get_adjusted_file_size(net['name'], 100)
         
-        # 基线
+        # 基线（无 TC）
         experiments.append({
             "network_scenarios": {"name": f"{net['name']}_BASELINE", "bw": "unlimited", "delay": "0ms", "loss": "0%"},
             "cpu_quota": 1.0, "threads": 4, "chunk_size": 1024*1024, 
@@ -329,7 +344,7 @@ def generate_hierarchical_experiments() -> List[Dict[str, Any]]:
             "bandwidth_mbps": net.get('mbps', 1000)
         })
         
-        # 全因子
+        # 全因子实验
         for cpu in [0.5, 1.0, 2.0]:
             for t in [1, 2, 4, 8, 16]:
                 for c in [256*1024, 1024*1024, 4*1024*1024]:
@@ -345,10 +360,9 @@ def generate_hierarchical_experiments() -> List[Dict[str, Any]]:
                         "bandwidth_mbps": net.get('mbps', 1000)
                     })
     
-    # 2. Probe Small (10MB)
-    print("🧪 Layer 2: Probe small (10MB, sparse)")
-    probe_small_nets = [NETWORK_SCENARIOS[0], NETWORK_SCENARIOS[2]]
-    for net in probe_small_nets:
+    # Probe Small (10MB)
+    print("🧪 Layer 2: Probe small")
+    for net in [NETWORK_SCENARIOS[0], NETWORK_SCENARIOS[2]]:
         for cpu in [0.5, 2.0]:
             for t in [1, 16]:
                 for c in [256*1024, 1024*1024]:
@@ -364,10 +378,9 @@ def generate_hierarchical_experiments() -> List[Dict[str, Any]]:
                         "bandwidth_mbps": net.get('mbps', 1000)
                     })
     
-    # 3. Probe Large (300MB)
-    print("🔬 Layer 3: Probe large (300MB, sparse, skip IoT_Weak)")
-    probe_large_nets = [NETWORK_SCENARIOS[1], NETWORK_SCENARIOS[2]]
-    for net in probe_large_nets:
+    # Probe Large (300MB) - 排除 IoT
+    print("🔬 Layer 3: Probe large")
+    for net in [NETWORK_SCENARIOS[1], NETWORK_SCENARIOS[2]]:
         for cpu in [0.5, 1.0, 2.0]:
             for t in [4, 8, 16]:
                 for c in [1024*1024, 4*1024*1024]:
@@ -391,57 +404,42 @@ def generate_hierarchical_experiments() -> List[Dict[str, Any]]:
 # ==============================
 
 def exec_with_timeout(container, command, timeout_sec):
-    """✅ 适配 Docker SDK 的 exec_run 并添加超时"""
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(container.exec_run, command)
         try:
             result = future.result(timeout=timeout_sec)
             return result.exit_code, result.output
         except concurrent.futures.TimeoutError:
-            print(f"   ❌ Client execution timeout ({timeout_sec}s)")
+            print(f"   ❌ Client timeout ({timeout_sec}s)")
             try:
                 container.kill()
             except:
                 pass
             return -1, b"TIMEOUT"
         except Exception as e:
-            print(f"   ❌ Client execution error: {e}")
+            print(f"   ❌ Client error: {e}")
             return -1, b"ERROR"
 
 def calculate_timeout(file_size_mb, bandwidth_mbps, threads=1):
-    """
-    
-    ✅ 根据带宽和文件大小动态计算 timeout：
-    - 基础传输时间 = file_size_mb * 8 / bandwidth_mbps
-    - 考虑 TCP 慢启动和重传，乘以系数 3
-    - 最小 60s，最大 1200s（20分钟）
-    """
     if bandwidth_mbps <= 0:
-        bandwidth_mbps = 1000  # 默认 Cloud
-    
-    base_time = (file_size_mb * 8) / bandwidth_mbps  # 理论秒数
-    estimated_time = base_time * 3  # 安全系数 3x
-    
+        bandwidth_mbps = 1000
+    base_time = (file_size_mb * 8) / bandwidth_mbps
+    estimated_time = base_time * 3  # 3x 安全系数
     timeout = max(60, min(estimated_time, 1200))
     return int(timeout)
 
 def run_single_experiment(client, config, run_id):
-    """
-    
-    """
     net_cfg = config["network_scenarios"]
     exp_type = config["exp_type"]
     file_size = config["file_size_mb"]
     is_baseline = "baseline" in exp_type or config.get("is_baseline", False)
-    # ✅ 修正语法错误
     bandwidth_mbps = config.get("bandwidth_mbps", 1000)
     
-    type_marker = {"anchor_baseline": "📏", "anchor": "⚓", "anchor_verify": "✓", 
+    type_marker = {"anchor_baseline": "📏", "anchor": "⚓", 
                    "probe_small": "🧪", "probe_large": "🔬"}.get(exp_type, "○")
     
     print(f"[{run_id:03d}] {type_marker} {net_cfg['name']:15s} | "
-          f"F:{file_size}MB | CPU:{config['cpu_quota']:.1f} | T:{config['threads']:2d} | "
-          f"C:{config['chunk_size']//1024}KB")
+          f"F:{file_size}MB | CPU:{config['cpu_quota']:.1f} | T:{config['threads']:2d}")
     
     nuclear_cleanup_safe()
     
@@ -451,15 +449,17 @@ def run_single_experiment(client, config, run_id):
     ifb_name = None
 
     try:
-        # 1. Server
+        # 1. Server - ✅ 关键修复：禁用 sendfile 确保流量经过 TC
         short_id = f"{run_id}_{int(time.time()*1000)%10000}"
         
+        # sendfile off 强制 Nginx 使用常规 read/write，确保经过 TC netem
         nginx_conf = """events {
     worker_connections 1024;
 }
 http {
-    sendfile on;
-    tcp_nopush on;
+    sendfile off;
+    tcp_nopush off;
+    tcp_nodelay on;
     client_max_body_size 500M;
     proxy_read_timeout 600s;
     send_timeout 600s;
@@ -485,17 +485,24 @@ http {
         
         # 2. VETH
         veth = get_veth_kernel_native(server_c.id)
+        print(f"   🌐 {veth}")
         
         # 3. TC
         if not is_baseline:
-            ifb_name = setup_isolated_tc(veth, net_cfg['bw'], net_cfg['delay'], net_cfg['loss'], run_id)
+            try:
+                ifb_name = setup_isolated_tc(veth, net_cfg['bw'], net_cfg['delay'], net_cfg['loss'], run_id)
+            except RuntimeError as e:
+                print(f"   [ERROR] TC setup failed: {e}")
+                return None
         else:
             ifb_name = None
-            sh(f"tc qdisc del dev {veth} root 2>/dev/null", check=False)
         
-        # 4. Network Ready
-        server_ip = client.api.inspect_container(server_c.id)["NetworkSettings"]["Networks"][NETWORK_NAME]["IPAddress"]
-        wait_for_network_steady_syn_only(server_ip)
+        # 4. Server IP
+        server_inspect = client.api.inspect_container(server_c.id)
+        networks = server_inspect["NetworkSettings"]["Networks"]
+        if NETWORK_NAME not in networks:
+            raise RuntimeError(f"Container not in {NETWORK_NAME}")
+        server_ip = networks[NETWORK_NAME]["IPAddress"]
         
         # 5. Client
         script_path = os.path.join(os.path.dirname(__file__), "pareto_client.py")
@@ -506,42 +513,46 @@ http {
             command="sleep 3600"
         )
         
-        # 6. Execute with Monitor
+        # 6. Execute
         with physical_monitor(client_c, config["nano_cpus"]) as mon:
             chunk_mb = config["chunk_size"] / (1024*1024)
             cmd = (f"python3 /app/client.py --url http://{server_ip}/data.bin "
                    f"--threads {config['threads']} --size {file_size} --buffer {chunk_mb}")
             
             t0 = time.perf_counter()
-            # ✅ 计算动态超时
             timeout_val = calculate_timeout(file_size, bandwidth_mbps)
-            # ✅ 使用并发执行器（防止 Docker SDK 阻塞）
             exit_code, output = exec_with_timeout(client_c, cmd, timeout_val)
             duration = time.perf_counter() - t0
             
+            output_str = output.decode("utf-8", errors="ignore")
+            
             client_res = {}
-            for line in reversed(output.decode("utf-8", errors="ignore").strip().split("\n")):
+            for line in reversed(output_str.strip().split("\n")):
                 if line.startswith("{") and line.endswith("}"):
-                    try: client_res = json.loads(line); break
-                    except: pass
+                    try: 
+                        client_res = json.loads(line)
+                        break
+                    except: 
+                        pass
             
             df_micro = mon.stop()
         
         if exit_code not in [0, 2]:
-            print(f"   ❌ Client failed: {exit_code}")
+            print(f"   ❌ Client failed: {exit_code}, output: {output_str[:100]}")
             return None
         
         # 7. Stats
         total_cpu_s = mon.get_total_cpu_seconds()
-        avg_cpu = df_micro["cpu_percent"].mean() if not df_micro.empty else 0
-        max_throttle = df_micro["throttle_ratio"].max() if not df_micro.empty else 0
         thr = client_res.get("throughput_mbps", 0)
+        bytes_downloaded = client_res.get("bytes_downloaded", 0)
         
-        efficiency_data = file_size / total_cpu_s if total_cpu_s > 1e-6 else 0
-        efficiency_mbps_per_cpu = thr / total_cpu_s if total_cpu_s > 1e-6 and thr > 0 else 0
-        cost_cpu_seconds = total_cpu_s
+        # ✅ 关键验证：检查实际吞吐量是否符合 TC 限制（允许 20% 误差）
+        if not is_baseline and thr > 0:
+            expected_max = bandwidth_mbps * 1.2  # 允许 20% burst
+            if thr > expected_max:
+                print(f"   [WARN] TC 可能未生效! 期望 <{expected_max:.1f}Mbps, 实际 {thr:.1f}Mbps")
         
-        tc_stats = get_tc_stats(veth, ifb_name) if not is_baseline else {}
+        efficiency = file_size / total_cpu_s if total_cpu_s > 1e-6 else 0
         
         result = {
             "run_id": run_id,
@@ -553,18 +564,14 @@ http {
             "chunk_kb": config["chunk_size"]//1024,
             "duration_s": round(duration, 3),
             "throughput_mbps": round(thr, 2),
-            "cost_cpu_seconds": round(cost_cpu_seconds, 6),
-            "efficiency_mb_per_cpus": round(efficiency_data, 2),
-            "efficiency_mbps_per_cpu": round(efficiency_mbps_per_cpu, 2),
-            "avg_cpu_pct": round(avg_cpu, 2),
-            "max_throttle_ratio": round(max_throttle, 4),
-            "kernel_rtt_ms": round(client_res.get("rtt_ms", -1), 2),
-            "tc_stats": json.dumps(tc_stats)[:500] if tc_stats else "",
+            "cost_cpu_seconds": round(total_cpu_s, 6),
+            "efficiency_mb_per_cpus": round(efficiency, 2),
+            "bytes_downloaded": bytes_downloaded,
             "exit_code": exit_code
         }
         
         status = "📏 BASELINE" if is_baseline else "✅"
-        print(f"   {status} Thr:{thr:6.1f}Mbps | Cost:{cost_cpu_seconds:.4f}s | Eff:{efficiency_data:.1f}MB/s")
+        print(f"   {status} Thr:{thr:6.1f}Mbps | Cost:{total_cpu_s:.4f}s | Time:{duration:.1f}s")
         
         return result
         
@@ -606,20 +613,11 @@ def main():
     prepare_test_file(300)
     experiments = generate_hierarchical_experiments()
     
-    # 同优先级内混洗
-    import random
-    random.seed(42)
-    for p in [1, 2, 3]:
-        group = [e for e in experiments if e['priority'] == p]
-        random.shuffle(group)
-        idx = [i for i, e in enumerate(experiments) if e['priority'] == p]
-        for i, exp in zip(idx, group):
-            experiments[i] = exp
+    print(f"\n📊 实验设计: {len(experiments)} 次实验")
+    print("=" * 70)
     
     output_csv = f"pareto_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     results = []
-    
-    print("\n" + "=" * 70)
     
     for i, cfg in enumerate(experiments):
         res = run_single_experiment(client, cfg, i+1)
@@ -627,30 +625,15 @@ def main():
             results.append(res)
             if len(results) % 5 == 0:
                 pd.DataFrame(results[-5:]).to_csv(output_csv, mode="a", 
-                                                  header=(i<5), index=False)
-                os.sync()
+                                                  header=(len(results)<=5), index=False)
         
-        if (i+1) % 50 == 0:
-            print(f"\n📈 Progress: {i+1}/{len(experiments)}\n")
+        if (i+1) % 10 == 0:
+            print(f"\n📈 Progress: {i+1}/{len(experiments)}, Success: {len(results)}\n")
     
     if results:
         pd.DataFrame(results).to_csv(output_csv, mode="a", header=False, index=False)
     
     print(f"\n✅ Completed: {len(results)}/{len(experiments)}")
-    
-    try:
-        df = pd.DataFrame(results)
-        print("\n📊 Multi-Scale Analysis:")
-        for fsize in [10, 100, 300]:
-            sub = df[df["file_size_mb"] == fsize]
-            if not sub.empty:
-                valid = sub[sub["throughput_mbps"] > 0]
-                if not valid.empty:
-                    best = valid.loc[valid["throughput_mbps"].idxmax()]
-                    print(f"  {fsize}MB: Max {best['throughput_mbps']:.1f} Mbps "
-                          f"(T={best['threads']}, C={best['chunk_kb']}KB, {best['scenario']})")
-    except Exception as e:
-        print(f"分析错误: {e}")
 
 if __name__ == "__main__":
     main()
