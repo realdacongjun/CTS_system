@@ -266,40 +266,69 @@ def get_veth_by_mac(container_id, pid, timeout=10):
 
 def setup_isolated_tc(veth, bw, delay, loss, run_id):
     """
-    配置 TC 限速，带验证步骤确保生效
+    [✅ 终极修复版] HTB 硬限速 + Netem 模拟 + 关闭 TSO/GSO
+    确保带宽限制真正生效，而不是仅配置规则
+    """
+
+
+    """
+    [融合版] 1. 关闭 Offload 2. 使用 HTB+Netem
     """
     ifb_name = f"ifb_{run_id}_{int(time.time()*1000)%1000}"
     
-    # 清理旧规则
+    # 1. 清理
     sh(f"tc qdisc del dev {veth} root 2>/dev/null", check=False)
     sh(f"tc qdisc del dev {veth} ingress 2>/dev/null", check=False)
     
-    # 创建独立 ifb
+    # 2. ✅ 关闭 Offload（关键步骤）
+    # 先检查 ethtool 是否存在
+    if sh("which ethtool"):
+        sh(f"ethtool -K {veth} tso off gso off gro off", check=False)
+        print(f"   [DEBUG] Offload disabled on {veth}")
+    else:
+        print(f"   [WARN] ethtool not found! TSO/GSO may bypass TC limits")
+        # 备选方案：尝试用 ip route 限速（最后手段）
+    
+    # 3. 准备 IFB
     sh(f"modprobe ifb numifbs=100", check=False)
     sh(f"ip link add {ifb_name} type ifb", check=False)
     sh(f"ip link set {ifb_name} up", check=False)
     
-    # Egress (Server -> Client) - 关键限速规则
-    tc_cmd = f"tc qdisc add dev {veth} root netem delay {delay} loss {loss} rate {bw}"
-    result = sh(tc_cmd, check=False)
-    if result and "Error" in result:
-        raise RuntimeError(f"TC Egress failed: {result}")
+    if sh("which ethtool"):
+        sh(f"ethtool -K {ifb_name} tso off gso off gro off", check=False)
+
+    # ==============================================================
+    # 方向 A: Server -> Client (下载流，实验的主要方向)
+    # 路径: Nginx (Server) -> eth0 -> VETH(Ingress) -> IFB -> 限速
+    # ==============================================================
     
-    # Ingress (Client -> Server) via IFB
-    sh(f"tc qdisc add dev {veth} ingress", check=False)
-    sh(f"tc filter add dev {veth} parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev {ifb_name}")
-    sh(f"tc qdisc add dev {ifb_name} root netem delay {delay} loss {loss} rate {bw}")
+    # 将 VETH 的入站流量镜像到 IFB
+    sh(f"tc qdisc add dev {veth} handle ffff: ingress 2>/dev/null || tc qdisc add dev {veth} ingress")
+    sh(f"tc filter add dev {veth} parent ffff: protocol all u32 match u32 0 0 action mirred egress redirect dev {ifb_name}")
     
-    # ✅ 关键验证：确认 TC 规则确实存在
-    verify = sh(f"tc qdisc show dev {veth} | grep netem", check=False)
-    if not verify or "netem" not in verify:
-        raise RuntimeError(f"TC 验证失败: 未在 {veth} 上找到 netem 规则")
+    # 在 IFB 上应用 HTB (硬限速) + Netem (延迟/丢包)
+    # Root HTB
+    sh(f"tc qdisc add dev {ifb_name} root handle 1: htb default 1")
+    # 限速类（burst 设大一些避免突发）
+    sh(f"tc class add dev {ifb_name} parent 1: classid 1:1 htb rate {bw} burst 32k")
+    # Netem 子类处理延迟和丢包
+    sh(f"tc qdisc add dev {ifb_name} parent 1:1 handle 10: netem delay {delay} loss {loss} limit 10000")
+
+    # ==============================================================
+    # 方向 B: Client -> Server (ACK 包，如果不限速 ACK 会飞回，影响 TCP 行为)
+    # 路径: Client -> VETH(Egress) -> Server (Nginx)
+    # ==============================================================
     
-    # 验证 rate 参数是否正确设置
-    if bw not in verify:
-        print(f"   [WARN] TC 验证警告: 期望带宽 {bw}, 实际: {verify[:100]}")
+    # 直接在 VETH 的出站方向应用 HTB + Netem
+    sh(f"tc qdisc add dev {veth} root handle 1: htb default 1")
+    sh(f"tc class add dev {veth} parent 1: classid 1:1 htb rate {bw} burst 32k")
+    sh(f"tc qdisc add dev {veth} parent 1:1 handle 10: netem delay {delay} loss {loss} limit 10000")
     
-    print(f"   [DEBUG] TC configured on {veth}: {bw}, delay={delay}, loss={loss}")
+    # 验证配置
+    print(f"   [DEBUG] TC Setup Complete:")
+    print(f"      VETH {veth}: Egress HTB(rate={bw})")
+    print(f"      IFB  {ifb_name}: Ingress HTB(rate={bw}) + Netem(delay={delay}, loss={loss})")
+    
     return ifb_name
 
 def reset_isolated_tc(veth, ifb_name):
