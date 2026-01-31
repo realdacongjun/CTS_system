@@ -81,50 +81,184 @@ def prepare_test_file(max_size_mb=300):
 # 3. VETH 定位（内核原教旨）
 # ==============================
 
-def get_veth_kernel_native(container_id, timeout=30):
+def get_veth_kernel_native(container_id, timeout=60):
     """
-    [最终修复版] 利用 VETH 对等原理定位接口
-    原理：容器内 eth0 的 iflink 值 === 宿主机 veth 的 ifindex 值
+    稳定获取 veth：等待 netns 就绪 -> 等待 eth0 UP -> 解析 ifindex -> MAC fallback
+    修复：Docker 异步网络创建导致的 /proc/<pid>/ns/net 不存在问题
     """
     start = time.time()
-    pid = None
+    client = docker.from_env()
     
-    # 1. 等待容器 PID 就绪 (Docker 层面)
+    # =================== 阶段 0: 获取 container 对象和 PID ===================
     while time.time() - start < timeout:
         try:
-            pid = sh(f"docker inspect -f '{{{{.State.Pid}}}}' {container_id}")
-            if pid and pid != '0': 
-                break
-        except: 
-            pass
-        time.sleep(0.5)
-        
-    if not pid:
-        raise RuntimeError(f"Container {container_id[:12]} failed to start (No PID)")
-
-    # 2. 循环重试：等待网络命名空间就绪
-    for i in range(40): # 20秒超时
-        try:
-            # 关键修复：通过 nsenter 读取容器内的 iflink
-            peer_idx = sh(f"nsenter -t {pid} -n cat /sys/class/net/eth0/iflink 2>/dev/null")
+            container = client.containers.get(container_id)
+            info = container.attrs
             
-            if peer_idx and peer_idx.isdigit():
-                # 在宿主机上查找对应 ifindex 的 veth
-                host_line = sh(f"ip -o link show | grep '^{peer_idx}:' 2>/dev/null")
+            if not info['State']['Running']:
+                if info['State']['ExitCode'] != 0:
+                    logs = container.logs(tail=50).decode('utf-8', errors='ignore')
+                    raise RuntimeError(f"Container exited ({info['State']['ExitCode']}). Logs: {logs}")
+                time.sleep(0.2)
+                continue
+            
+            pid = info['State']['Pid']
+            if pid and pid != 0:
+                break
                 
-                if host_line:
-                    # 解析接口名：格式 "1044: vethXXXXX@if1043: ..."
-                    parts = host_line.split(':')[1].strip().split('@')[0].split()
-                    if parts:
-                        return parts[0]
-                    
-        except Exception:
-            pass
-        time.sleep(0.5)
+        except docker.errors.NotFound:
+            raise RuntimeError(f"Container {container_id} not found")
+        except Exception as e:
+            if "exited" in str(e):
+                raise
+            time.sleep(0.2)
+    else:
+        raise RuntimeError("Timeout: Container did not start")
 
-    # 调试信息
-    debug_log = sh(f"nsenter -t {pid} -n ip addr 2>&1 || echo 'nsenter failed'")
-    raise RuntimeError(f"VETH lookup failed for {container_id[:12]} (PID={pid}). Debug: {debug_log}")
+    print(f"   [DEBUG] Container {container_id[:12]} PID: {pid}")
+
+    # =================== 阶段 1: 关键修复 - 等待 netns 文件出现 ===================
+    netns_path = f"/proc/{pid}/ns/net"
+    ns_start = time.time()
+    
+    while time.time() - ns_start < timeout:
+        if os.path.exists(netns_path):
+            print(f"   [DEBUG] Netns ready: {netns_path}")
+            break
+        print(f"   [WAIT] Netns not ready yet: {netns_path}...")
+        time.sleep(0.5)
+    else:
+        # 最后检查：如果仍不存在，检查容器是否还在运行
+        container.reload()
+        if not container.attrs['State']['Running']:
+            raise RuntimeError(f"Container died while waiting for netns. Exit code: {container.attrs['State']['ExitCode']}")
+        raise RuntimeError(f"Timeout: {netns_path} not created after {timeout}s")
+
+    # =================== 阶段 2: 等待 eth0 出现并 UP ===================
+    eth0_start = time.time()
+    peer_ifindex = None
+    
+    while time.time() - eth0_start < timeout:
+        try:
+            # 双重检查 netns 仍存在（防止容器突然退出）
+            if not os.path.exists(netns_path):
+                raise RuntimeError("Netns disappeared during check")
+            
+            # 使用 nsenter 检查 eth0 状态
+            link_output = sh(f"nsenter -t {pid} -n ip link show eth0 2>&1", check=False)
+            
+            # eth0 还不存在
+            if "does not exist" in link_output:
+                print(f"   [WAIT] eth0 not created yet...")
+                time.sleep(0.5)
+                continue
+            
+            # eth0 存在但未 UP（网络配置中）
+            if "state UP" not in link_output:
+                print(f"   [WAIT] eth0 exists but not UP: {link_output[:60].strip()}...")
+                time.sleep(0.3)
+                continue
+            
+            # eth0 UP - 提取 peer ifindex
+            match = re.search(r'eth0@if(\d+)', link_output)
+            if match:
+                peer_ifindex = match.group(1)
+                print(f"   [DEBUG] eth0 UP, peer ifindex: {peer_ifindex}")
+                break
+            else:
+                # 老内核可能没有 @if 格式，尝试备选解析
+                print(f"   [WARN] Could not parse eth0@ifXXXX from: {link_output[:100]}")
+                time.sleep(0.5)
+                
+        except Exception as e:
+            print(f"   [WARN] nsenter check failed: {e}")
+            time.sleep(0.5)
+    
+    if not peer_ifindex:
+        print("   [WARN] eth0 timeout, attempting MAC fallback...")
+        return get_veth_by_mac(container_id, pid, timeout=15)
+
+    # =================== 阶段 3: 在宿主机查找 veth ===================
+    try:
+        # 方法 A: 通过 ip link 直接查找（最快）
+        result = sh(f"ip -o link show | grep '^{peer_ifindex}:' | head -1", check=False)
+        if result:
+            # 格式: "1044: vethXXXXX@if1043: <BROADCAST,MULTICAST,UP,LOWER_UP>..."
+            match = re.match(r'\d+:\s+([^\s:@]+)', result)
+            # ✅ 关键修复1：使用 startswith 确保是 veth，不是包含 veth 的其他字符串
+            if match and match.group(1).startswith('veth'):
+                veth_name = match.group(1)
+                print(f"   [OK] Found veth via ip link: {veth_name}")
+                return veth_name
+        
+        # 方法 B: 扫描 /sys/class/net（更可靠，但慢）
+        for iface in os.listdir('/sys/class/net/'):
+            if not iface.startswith('veth'):
+                continue
+            try:
+                with open(f'/sys/class/net/{iface}/iflink', 'r') as f:
+                    if f.read().strip() == peer_ifindex:
+                        print(f"   [OK] Found veth via sysfs: {iface}")
+                        return iface
+            except:
+                continue
+        
+        # 方法 C: 通过 bridge fdb + MAC（最后手段）
+        print("   [WARN] ifindex methods failed, trying bridge fdb...")
+        mac = sh(f"docker inspect -f '{{{{range .NetworkSettings.Networks}}}}{{{{.MacAddress}}}}{{{{end}}}}' {container_id}").lower().strip()
+        if mac:
+            for _ in range(10):
+                fdb = sh(f"bridge fdb show | grep -i '{mac}' | grep 'veth' | head -1", check=False)
+                if fdb:
+                    parts = fdb.split()
+                    for i, p in enumerate(parts):
+                        if p == 'dev' and i+1 < len(parts):
+                            veth_name = parts[i+1]
+                            # ✅ 关键修复2：确保提取的是 veth 接口，不是其他内容
+                            if veth_name.startswith('veth'):
+                                print(f"   [OK] Found veth via bridge fdb: {veth_name}")
+                                return veth_name
+                time.sleep(0.2)
+                
+    except Exception as e:
+        print(f"   [ERROR] Find veth failed: {e}")
+    
+    raise RuntimeError(f"All veth detection methods failed for {container_id[:12]}")
+
+
+def get_veth_by_mac(container_id, pid, timeout=10):
+    """
+    备选方案：通过 MAC 地址在 bridge fdb 中查找
+    """
+    try:
+        # 获取容器 MAC
+        mac = sh(f"docker inspect -f '{{{{range .NetworkSettings.Networks}}}}{{{{.MacAddress}}}}{{{{end}}}}' {container_id}").lower().strip()
+        print(f"   [DEBUG] MAC fallback: {mac}")
+        
+        if not mac:
+            raise RuntimeError("Cannot get MAC")
+        
+        for _ in range(timeout * 2):  # 20 次尝试
+            try:
+                # 在 bridge fdb 中查找
+                fdb = sh(f"bridge fdb show | grep -i '{mac}' | head -1", check=False)
+                if fdb and 'veth' in fdb:
+                    parts = fdb.split()
+                    for i, p in enumerate(parts):
+                        if p == 'dev' and i+1 < len(parts):
+                            candidate = parts[i+1]
+                            # ✅ 关键修复3：确保返回的是 veth 接口
+                            if candidate.startswith('veth'):
+                                print(f"   [OK] Found veth by MAC: {candidate}")
+                                return candidate
+            except:
+                pass
+            time.sleep(0.5)
+            
+    except Exception as e:
+        print(f"   [ERROR] MAC fallback failed: {e}")
+    
+    raise RuntimeError("All veth detection methods failed")
 
 # ==============================
 # 4. TC 配置（完全隔离 IFB）- 带验证
