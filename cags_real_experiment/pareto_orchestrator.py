@@ -587,39 +587,25 @@ def get_adjusted_file_size(net_name, base_size):
 #     print(f"✅ Total Experiments Generated: {len(experiments)}")
 #     return experiments
 def generate_hierarchical_experiments(NETWORK_SCENARIOS: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    生成层次化实验配置
+    核心原则：
+    1. 同一场景同一张Pareto图必须使用相同文件大小
+    2. IoT专注拉开CPU差距（因为网络是瓶颈）
+    3. Edge/Cloud按文件大小分层，不混用
+    """
     experiments = []
-    print("🎯 Generating Hierarchical Experiments (Enhanced for Pareto Smoothing)...")
+    print("🎯 Generating Hierarchical Experiments (Unified File Size per Plot)...")
 
     for net in NETWORK_SCENARIOS:
         # 基础大小限制 (IoT=10, Edge=50, Cloud=100)
         adj_size = get_adjusted_file_size(net['name'], 100)
 
         # ==========================
-        # 1️⃣ Baseline Anchor (基准点)
+        # 1️⃣ Anchor 全因子扫描（每个场景的基础）
         # ==========================
-        experiments.append({
-            "network_scenarios": {
-                "name": f"{net['name']}_BASELINE", 
-                "bw": "unlimited", 
-                "delay": "0ms", 
-                "loss": "0%"
-            },
-            "cpu_quota": 1.0,
-            "threads": 4,
-            "chunk_size": 1024*1024,
-            "file_size_mb": adj_size,
-            "priority": 1,
-            "nano_cpus": int(1e9),
-            "exp_type": "anchor_baseline",
-            "bandwidth_mbps": net.get('mbps', 1000)
-        })
-
-        # ==========================
-        # 2️⃣ Anchor 全因子扫描 (粗粒度)
-        # ==========================
-        # IoT 线程少一点，Cloud 线程多一点
         thread_list = [1, 2, 4] if "IoT" in net['name'] else [1, 2, 4, 8, 16]
-
+        
         for cpu in [0.5, 1.0, 2.0]:
             for t in thread_list:
                 for c in [256*1024, 1024*1024, 4*1024*1024]:
@@ -636,9 +622,30 @@ def generate_hierarchical_experiments(NETWORK_SCENARIOS: List[Dict[str, Any]]) -
                     })
 
         # ==========================
-        # 3️⃣ Probe Small 极端点 (10MB)
+        # 2️⃣ IoT 专项：低CPU配置（试图拉开成本差距）
         # ==========================
-        # 在所有场景下都跑一下小文件，确保有共同底线
+        if "IoT" in net['name']:
+            print(f"   + Injecting Low-CPU experiments for {net['name']}")
+            # 用极低CPU配额试图产生更低的成本
+            for cpu in [0.25, 0.125]:  
+                for t in [1, 2]:
+                    for c in [64*1024, 256*1024]:  # 小分片更适合弱网
+                        experiments.append({
+                            "network_scenarios": net,
+                            "cpu_quota": cpu,
+                            "threads": t,
+                            "chunk_size": c,
+                            "file_size_mb": 10,  # 保持10MB避免超时
+                            "exp_type": "iot_low_cpu",
+                            "nano_cpus": max(int(cpu * 1e9), 100000000),  # 最小0.1核
+                            "priority": 2,
+                            "bandwidth_mbps": net.get('mbps', 2)
+                        })
+
+        # ==========================
+        # 3️⃣ Probe Small（10MB，所有场景）
+        # 目的：建立"小文件基准"，跨场景可比
+        # ==========================
         for cpu in [0.5, 2.0]:
             for t in [1, 16]:
                 for c in [256*1024, 1024*1024]:
@@ -655,91 +662,93 @@ def generate_hierarchical_experiments(NETWORK_SCENARIOS: List[Dict[str, Any]]) -
                     })
 
         # ==========================
-        # 3️⃣.5️⃣ [新增] IoT 专项填补 (Gap Filling)
-        # 目标：试图让 IoT 环境下跑通 20MB/30MB，把 n=1 变成 n=2 或 3
+        # 4️⃣ Edge/Cloud 大文件实验（分层设计）
+        # 原则：同一场景的Pareto图只用一种文件大小
         # ==========================
-        if "IoT" in net['name']:
-            print(f"   + Injecting Gap-Filling experiments for {net['name']}")
-            # 尝试突破 10MB 限制，测试 20MB 和 30MB
-            for gap_size in [20, 30]:
-                # 只用最保守的参数，增加成功率
-                for cpu in [0.5, 1.0]: 
-                    for t in [1, 2, 4]:
-                        experiments.append({
-                            "network_scenarios": net,
-                            "cpu_quota": cpu,
-                            "threads": t,
-                            "chunk_size": 256*1024, # 小分片有助于弱网
-                            "file_size_mb": gap_size,
-                            "exp_type": "iot_gap_fill", # 标记一下，方便后续分析
-                            "nano_cpus": int(cpu * 1e9),
-                            "priority": 2, # 高优先级
-                            "bandwidth_mbps": net.get('mbps', 2)
-                        })
-
-        # ==========================
-        # 4️⃣ Probe Large 极端点 (300MB)
-        # ==========================
-        if "IoT" not in net['name']: # IoT 跑不动 300MB，跳过
-            for cpu in [0.5, 1.0, 2.0]:
-                for t in [4, 8, 16]:
-                    for c in [1024*1024, 4*1024*1024]:
-                        experiments.append({
-                            "network_scenarios": net,
-                            "cpu_quota": cpu,
-                            "threads": t,
-                            "chunk_size": c,
-                            "file_size_mb": 300,
-                            "exp_type": "probe_large",
-                            "nano_cpus": int(cpu * 1e9),
-                            "priority": 3,
-                            "bandwidth_mbps": net.get('mbps', 1000)
-                        })
-
-        # ==========================
-        # 4️⃣.5️⃣ [新增] Edge/Cloud 帕累托平滑 (Smoothing)
-        # 目标：在 CPU 0.5~1.5 和 线程 2~8 的"甜点区"增加采样
-        # ==========================
-        if "Edge" in net['name'] or "Cloud" in net['name']:
-            print(f"   + Injecting Smoothing experiments for {net['name']}")
-            # 使用非标准的步长，填补 anchor 的空隙
-            # Anchor 是 [0.5, 1.0, 2.0]，这里补 [0.8, 1.2, 1.5]
-            smooth_cpus = [0.8, 1.2, 1.5]
-            # Anchor 是 [1, 2, 4, 8]，这里补 [3, 5, 6]
-            smooth_threads = [3, 5, 6]
+        if "IoT" not in net['name']:
             
-            for cpu in smooth_cpus:
-                for t in smooth_threads:
-                    experiments.append({
-                        "network_scenarios": net,
-                        "cpu_quota": cpu,
-                        "threads": t,
-                        "chunk_size": 1024*1024, # 标准分片即可
-                        "file_size_mb": adj_size, # 保持和 Anchor 一样的文件大小
-                        "exp_type": "pareto_smooth",
-                        "nano_cpus": int(cpu * 1e9),
-                        "priority": 4, # 低优先级，最后跑
-                        "bandwidth_mbps": net.get('mbps', 1000)
-                    })
+            # 确定该场景的大文件配置
+            if "Edge" in net['name']:
+                # Edge: 50MB（标准）+ 300MB（极端）
+                large_sizes = [50, 300]
+            else:  # Cloud
+                # Cloud: 100MB（标准）+ 300MB（极端）
+                large_sizes = [100, 300]
+            
+            for file_size in large_sizes:
+                # 4.1 标准大文件配置（类似原probe_large）
+                thread_list_large = [4, 8, 16] if file_size == 300 else [2, 4, 8, 16]
+                for cpu in [0.5, 1.0, 2.0]:
+                    for t in thread_list_large:
+                        for c in [1024*1024, 4*1024*1024]:
+                            experiments.append({
+                                "network_scenarios": net,
+                                "cpu_quota": cpu,
+                                "threads": t,
+                                "chunk_size": c,
+                                "file_size_mb": file_size,
+                                "exp_type": "probe_large",
+                                "nano_cpus": int(cpu * 1e9),
+                                "priority": 3,
+                                "bandwidth_mbps": net.get('mbps', 1000)
+                            })
+                
+                # 4.2 Pareto平滑采样（填补空隙，仅针对标准大小）
+                # 300MB的不做平滑（时间成本太高），只做50MB/100MB
+                if file_size == adj_size:
+                    print(f"   + Injecting Pareto Smoothing for {net['name']} ({file_size}MB)")
+                    # 使用标准分数步长，避免cgroup调度问题
+                    smooth_cpus = [0.75, 1.25, 1.5]  # 3/4, 5/4, 3/2核
+                    smooth_threads = [3, 5, 6]  # 填补1-2-4-8-16的空隙
+                    
+                    for cpu in smooth_cpus:
+                        for t in smooth_threads:
+                            experiments.append({
+                                "network_scenarios": net,
+                                "cpu_quota": cpu,
+                                "threads": t,
+                                "chunk_size": 1024*1024,  # 标准1MB分片
+                                "file_size_mb": file_size,
+                                "exp_type": "pareto_smooth",
+                                "nano_cpus": int(cpu * 1e9),
+                                "priority": 4,  # 低优先级
+                                "bandwidth_mbps": net.get('mbps', 1000)
+                            })
 
     # ==========================
-    # 5️⃣ 排序与去重
+    # 5️⃣ 去重与排序
     # ==========================
-    # 简单去重，防止 config 完全重复
     unique_experiments = []
     seen = set()
+    
     for exp in experiments:
-        # 生成一个唯一指纹 tuple
-        sig = (exp['network_scenarios']['name'], exp['cpu_quota'], exp['threads'], 
-               exp['chunk_size'], exp['file_size_mb'])
+        # 生成唯一指纹：(场景, CPU, 线程, 分片, 文件大小)
+        sig = (
+            exp['network_scenarios']['name'], 
+            exp['cpu_quota'], 
+            exp['threads'], 
+            exp['chunk_size'], 
+            exp['file_size_mb']
+        )
         if sig not in seen:
             seen.add(sig)
             unique_experiments.append(exp)
+        else:
+            # 记录去重信息
+            print(f"   [DEDUP] Skipped duplicate: {sig}")
 
+    # 按优先级排序
     unique_experiments.sort(key=lambda x: x['priority'])
-    print(f"✅ Total Experiments Generated: {len(unique_experiments)} (Original+Enhanced)")
+    
+    # 打印统计信息
+    print(f"\n📊 Experiment Distribution:")
+    for exp_type in ['anchor', 'iot_low_cpu', 'probe_small', 'probe_large', 'pareto_smooth']:
+        count = len([e for e in unique_experiments if e['exp_type'] == exp_type])
+        if count > 0:
+            print(f"   {exp_type:20s}: {count:3d}")
+    
+    print(f"\n✅ Total Unique Experiments: {len(unique_experiments)}")
     return unique_experiments
-
 # ==============================
 # 超时计算函数
 # ==============================
