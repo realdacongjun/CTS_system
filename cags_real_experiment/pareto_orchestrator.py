@@ -493,15 +493,109 @@ def get_adjusted_file_size(net_name, base_size):
     else:
         return base_size
 
+# def generate_hierarchical_experiments(NETWORK_SCENARIOS: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+#     experiments = []
+#     print("🎯 Generating Hierarchical Experiments...")
+
+#     for net in NETWORK_SCENARIOS:
+#         adj_size = get_adjusted_file_size(net['name'], 100)
+
+#         # ==========================
+#         # 1️⃣ Baseline Anchor
+#         # ==========================
+#         experiments.append({
+#             "network_scenarios": {
+#                 "name": f"{net['name']}_BASELINE", 
+#                 "bw": "unlimited", 
+#                 "delay": "0ms", 
+#                 "loss": "0%"
+#             },
+#             "cpu_quota": 1.0,
+#             "threads": 4,
+#             "chunk_size": 1024*1024,
+#             "file_size_mb": adj_size,
+#             "priority": 1,
+#             "nano_cpus": int(1e9),
+#             "exp_type": "anchor_baseline",
+#             "bandwidth_mbps": net.get('mbps', 1000)
+#         })
+
+#         # ==========================
+#         # 2️⃣ Anchor 全因子实验
+#         # ==========================
+#         thread_list = [1, 2, 4] if "IoT" in net['name'] else [1, 2, 4, 8, 16]
+
+#         for cpu in [0.5, 1.0, 2.0]:
+#             for t in thread_list:
+#                 for c in [256*1024, 1024*1024, 4*1024*1024]:
+#                     experiments.append({
+#                         "network_scenarios": net,
+#                         "cpu_quota": cpu,
+#                         "threads": t,
+#                         "chunk_size": c,
+#                         "file_size_mb": adj_size,
+#                         "exp_type": "anchor",
+#                         "nano_cpus": int(cpu * 1e9),
+#                         "priority": 1,
+#                         "bandwidth_mbps": net.get('mbps', 1000)
+#                     })
+
+#         # ==========================
+#         # 3️⃣ Probe Small 极端点
+#         # IoT 和 Cloud / 弱网/高速网小文件测试
+#         # ==========================
+#         for net_probe in [NETWORK_SCENARIOS[0], NETWORK_SCENARIOS[2]]:
+#             for cpu in [0.5, 2.0]:
+#                 for t in [1, 16]:
+#                     for c in [256*1024, 1024*1024]:
+#                         experiments.append({
+#                             "network_scenarios": net_probe,
+#                             "cpu_quota": cpu,
+#                             "threads": t,
+#                             "chunk_size": c,
+#                             "file_size_mb": 10,
+#                             "exp_type": "probe_small",
+#                             "nano_cpus": int(cpu * 1e9),
+#                             "priority": 2,
+#                             "bandwidth_mbps": net_probe.get('mbps', 1000)
+#                         })
+
+#         # ==========================
+#         # 4️⃣ Probe Large 极端点
+#         # 排除 IoT, 测大文件+高并发
+#         # ==========================
+#         for net_probe in [NETWORK_SCENARIOS[1], NETWORK_SCENARIOS[2]]:
+#             for cpu in [0.5, 1.0, 2.0]:
+#                 for t in [4, 8, 16]:
+#                     for c in [1024*1024, 4*1024*1024]:
+#                         experiments.append({
+#                             "network_scenarios": net_probe,
+#                             "cpu_quota": cpu,
+#                             "threads": t,
+#                             "chunk_size": c,
+#                             "file_size_mb": 300,
+#                             "exp_type": "probe_large",
+#                             "nano_cpus": int(cpu * 1e9),
+#                             "priority": 3,
+#                             "bandwidth_mbps": net_probe.get('mbps', 1000)
+#                         })
+
+#     # ==========================
+#     # 5️⃣ 排序，保证 priority 先行
+#     # ==========================
+#     experiments.sort(key=lambda x: x['priority'])
+#     print(f"✅ Total Experiments Generated: {len(experiments)}")
+#     return experiments
 def generate_hierarchical_experiments(NETWORK_SCENARIOS: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     experiments = []
-    print("🎯 Generating Hierarchical Experiments...")
+    print("🎯 Generating Hierarchical Experiments (Enhanced for Pareto Smoothing)...")
 
     for net in NETWORK_SCENARIOS:
+        # 基础大小限制 (IoT=10, Edge=50, Cloud=100)
         adj_size = get_adjusted_file_size(net['name'], 100)
 
         # ==========================
-        # 1️⃣ Baseline Anchor
+        # 1️⃣ Baseline Anchor (基准点)
         # ==========================
         experiments.append({
             "network_scenarios": {
@@ -521,8 +615,9 @@ def generate_hierarchical_experiments(NETWORK_SCENARIOS: List[Dict[str, Any]]) -
         })
 
         # ==========================
-        # 2️⃣ Anchor 全因子实验
+        # 2️⃣ Anchor 全因子扫描 (粗粒度)
         # ==========================
+        # IoT 线程少一点，Cloud 线程多一点
         thread_list = [1, 2, 4] if "IoT" in net['name'] else [1, 2, 4, 8, 16]
 
         for cpu in [0.5, 1.0, 2.0]:
@@ -541,35 +636,56 @@ def generate_hierarchical_experiments(NETWORK_SCENARIOS: List[Dict[str, Any]]) -
                     })
 
         # ==========================
-        # 3️⃣ Probe Small 极端点
-        # IoT 和 Cloud / 弱网/高速网小文件测试
+        # 3️⃣ Probe Small 极端点 (10MB)
         # ==========================
-        for net_probe in [NETWORK_SCENARIOS[0], NETWORK_SCENARIOS[2]]:
-            for cpu in [0.5, 2.0]:
-                for t in [1, 16]:
-                    for c in [256*1024, 1024*1024]:
+        # 在所有场景下都跑一下小文件，确保有共同底线
+        for cpu in [0.5, 2.0]:
+            for t in [1, 16]:
+                for c in [256*1024, 1024*1024]:
+                    experiments.append({
+                        "network_scenarios": net,
+                        "cpu_quota": cpu,
+                        "threads": t,
+                        "chunk_size": c,
+                        "file_size_mb": 10,
+                        "exp_type": "probe_small",
+                        "nano_cpus": int(cpu * 1e9),
+                        "priority": 2,
+                        "bandwidth_mbps": net.get('mbps', 1000)
+                    })
+
+        # ==========================
+        # 3️⃣.5️⃣ [新增] IoT 专项填补 (Gap Filling)
+        # 目标：试图让 IoT 环境下跑通 20MB/30MB，把 n=1 变成 n=2 或 3
+        # ==========================
+        if "IoT" in net['name']:
+            print(f"   + Injecting Gap-Filling experiments for {net['name']}")
+            # 尝试突破 10MB 限制，测试 20MB 和 30MB
+            for gap_size in [20, 30]:
+                # 只用最保守的参数，增加成功率
+                for cpu in [0.5, 1.0]: 
+                    for t in [1, 2, 4]:
                         experiments.append({
-                            "network_scenarios": net_probe,
+                            "network_scenarios": net,
                             "cpu_quota": cpu,
                             "threads": t,
-                            "chunk_size": c,
-                            "file_size_mb": 10,
-                            "exp_type": "probe_small",
+                            "chunk_size": 256*1024, # 小分片有助于弱网
+                            "file_size_mb": gap_size,
+                            "exp_type": "iot_gap_fill", # 标记一下，方便后续分析
                             "nano_cpus": int(cpu * 1e9),
-                            "priority": 2,
-                            "bandwidth_mbps": net_probe.get('mbps', 1000)
+                            "priority": 2, # 高优先级
+                            "bandwidth_mbps": net.get('mbps', 2)
                         })
 
         # ==========================
-        # 4️⃣ Probe Large 极端点
-        # 排除 IoT, 测大文件+高并发
+        # 4️⃣ Probe Large 极端点 (300MB)
         # ==========================
-        for net_probe in [NETWORK_SCENARIOS[1], NETWORK_SCENARIOS[2]]:
+        if "IoT" not in net['name']: # IoT 跑不动 300MB，跳过
             for cpu in [0.5, 1.0, 2.0]:
                 for t in [4, 8, 16]:
                     for c in [1024*1024, 4*1024*1024]:
                         experiments.append({
-                            "network_scenarios": net_probe,
+                            "network_scenarios": net,
                             "cpu_quota": cpu,
                             "threads": t,
                             "chunk_size": c,
@@ -577,16 +693,52 @@ def generate_hierarchical_experiments(NETWORK_SCENARIOS: List[Dict[str, Any]]) -
                             "exp_type": "probe_large",
                             "nano_cpus": int(cpu * 1e9),
                             "priority": 3,
-                            "bandwidth_mbps": net_probe.get('mbps', 1000)
+                            "bandwidth_mbps": net.get('mbps', 1000)
                         })
 
-    # ==========================
-    # 5️⃣ 排序，保证 priority 先行
-    # ==========================
-    experiments.sort(key=lambda x: x['priority'])
-    print(f"✅ Total Experiments Generated: {len(experiments)}")
-    return experiments
+        # ==========================
+        # 4️⃣.5️⃣ [新增] Edge/Cloud 帕累托平滑 (Smoothing)
+        # 目标：在 CPU 0.5~1.5 和 线程 2~8 的"甜点区"增加采样
+        # ==========================
+        if "Edge" in net['name'] or "Cloud" in net['name']:
+            print(f"   + Injecting Smoothing experiments for {net['name']}")
+            # 使用非标准的步长，填补 anchor 的空隙
+            # Anchor 是 [0.5, 1.0, 2.0]，这里补 [0.8, 1.2, 1.5]
+            smooth_cpus = [0.8, 1.2, 1.5]
+            # Anchor 是 [1, 2, 4, 8]，这里补 [3, 5, 6]
+            smooth_threads = [3, 5, 6]
+            
+            for cpu in smooth_cpus:
+                for t in smooth_threads:
+                    experiments.append({
+                        "network_scenarios": net,
+                        "cpu_quota": cpu,
+                        "threads": t,
+                        "chunk_size": 1024*1024, # 标准分片即可
+                        "file_size_mb": adj_size, # 保持和 Anchor 一样的文件大小
+                        "exp_type": "pareto_smooth",
+                        "nano_cpus": int(cpu * 1e9),
+                        "priority": 4, # 低优先级，最后跑
+                        "bandwidth_mbps": net.get('mbps', 1000)
+                    })
 
+    # ==========================
+    # 5️⃣ 排序与去重
+    # ==========================
+    # 简单去重，防止 config 完全重复
+    unique_experiments = []
+    seen = set()
+    for exp in experiments:
+        # 生成一个唯一指纹 tuple
+        sig = (exp['network_scenarios']['name'], exp['cpu_quota'], exp['threads'], 
+               exp['chunk_size'], exp['file_size_mb'])
+        if sig not in seen:
+            seen.add(sig)
+            unique_experiments.append(exp)
+
+    unique_experiments.sort(key=lambda x: x['priority'])
+    print(f"✅ Total Experiments Generated: {len(unique_experiments)} (Original+Enhanced)")
+    return unique_experiments
 
 # ==============================
 # 超时计算函数

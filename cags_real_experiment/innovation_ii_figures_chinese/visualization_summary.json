@@ -1,0 +1,77 @@
+{
+  "generation_time": "2026-02-12 19:37:22",
+  "data_file": "pareto_cleaned_final.csv",
+  "total_records": 245,
+  "figures_generated": 5,
+  "figure_summaries": {
+    "fig5_1": {
+      "anchor_points": 93,
+      "probe_small_points": 48,
+      "probe_large_points": 101,
+      "total_points": 242
+    },
+    "fig5_2": {
+      "scenarios": 3,
+      "total_configs": 7,
+      "max_cv": 78.50936804315576,
+      "min_cv": 6.16840043771445
+    },
+    "fig5_3": [
+      {
+        "scenario": "IoT_Weak",
+        "total_points": 51,
+        "pareto_points": 7
+      },
+      {
+        "scenario": "Edge_Normal",
+        "total_points": 21,
+        "pareto_points": 3
+      },
+      {
+        "scenario": "Cloud_Fast",
+        "total_points": 45,
+        "pareto_points": 2
+      }
+    ],
+    "fig5_4": {
+      "total_points": 45,
+      "pareto_points": 2,
+      "knee_points": 3,
+      "knee_configs": [
+        [
+          4,
+          1.0,
+          "节能优先"
+        ],
+        [
+          4,
+          1.0,
+          "平衡配置"
+        ],
+        [
+          8,
+          2.0,
+          "性能优先"
+        ]
+      ]
+    },
+    "fig5_5": [
+      {
+        "scenario": "IoT_Weak",
+        "baseline": 0.19333333333333333,
+        "optimal": 0.6466666666666666,
+        "improvement": 234.48275862068962,
+        "unit": "Mbps",
+        "valid": true
+      },
+      {
+        "scenario": "Cloud_Fast",
+        "baseline": 195.88666666666666,
+        "optimal": 233.67666666666665,
+        "improvement": 19.2917673484668,
+        "unit": "MB/CPU·s",
+        "valid": true
+      }
+    ]
+  }
+}
