@@ -20,7 +20,7 @@ CONFIG = {
     "epochs": 200,             # 增加训练轮数，让模型充分训练
     "embed_dim": 32,
     "kl_coeff": 0.15,          # [调整] 增加正则化权重，让不确定性更准确
-    "model_save_path": "cts_best_model_full.pth" 
+    "model_save_path": "cts_best_model_full_modified.pth" 
 }
 
 # 路径检查与自动修正 (解决你的路径烦恼)

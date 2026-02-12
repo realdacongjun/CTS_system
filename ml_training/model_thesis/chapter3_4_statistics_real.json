@@ -1,0 +1,8 @@
+{
+  "full_model_rmse": 155.25425215593935,
+  "single_tower_rmse": 27.189233062579202,
+  "no_attention_rmse": 23.984166326453792,
+  "dual_tower_degradation_percent": -82.48728605818152,
+  "attention_degradation_percent": -84.55168474074141,
+  "experiment_type": "real_data_ablation_study"
+}

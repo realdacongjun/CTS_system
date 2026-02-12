@@ -1,0 +1,10 @@
+environment,environment_desc,algorithm,decompression_time
+high_performance_server,高性能服务器,gzip,0.025362491607666016
+high_performance_server,高性能服务器,lz4,0.006899452209472657
+high_performance_server,高性能服务器,zstd,0.003651142120361328
+mid_performance_pc,普通PC,gzip,0.06284213066101074
+mid_performance_pc,普通PC,lz4,0.01786518096923828
+mid_performance_pc,普通PC,zstd,0.00951528549194336
+low_performance_arm,边缘网关(ARM),gzip,0.15275287628173828
+low_performance_arm,边缘网关(ARM),lz4,0.04212913513183594
+low_performance_arm,边缘网关(ARM),zstd,0.02246875762939453

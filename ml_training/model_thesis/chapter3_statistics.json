@@ -1,0 +1,9 @@
+{
+  "text_layer_zstd_advantage_vs_gzip_percent": NaN,
+  "text_layer_zstd_advantage_vs_lz4_percent": NaN,
+  "binary_layer_zstd_improvement_percent": NaN,
+  "binary_layer_zstd_time_increase_percent": NaN,
+  "server_decompression_time": 0.05059695243835449,
+  "raspberry_decompression_time": 0.28462333679199214,
+  "performance_ratio": 5.625305933964442
+}

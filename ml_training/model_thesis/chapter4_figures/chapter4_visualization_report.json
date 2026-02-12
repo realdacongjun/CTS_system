@@ -1,0 +1,68 @@
+{
+  "chapter_title": "第四章 基于帕累托前沿的多目标自适应传输优化",
+  "innovation_point": "Innovation Point II: Multi-objective Adaptive Transmission Optimization Based on Pareto Frontier",
+  "visualization_chain": {
+    "figure_5_1": {
+      "title": "Anchor-Probe 分层采样设计矩阵",
+      "purpose": "展示如何用有限实验成本覆盖庞大参数空间",
+      "statistics": {
+        "anchor_points": 5,
+        "probe_points": 6,
+        "total_experiments": 11,
+        "sampling_efficiency": "88.2% core coverage"
+      }
+    },
+    "figure_5_2": {
+      "title": "风险势垒与可行解筛选机制",
+      "purpose": "解释可靠性硬约束如何一票否决高丢包配置",
+      "statistics": {
+        "total_configurations": 100,
+        "feasible_solutions": 21,
+        "infeasible_solutions": 79,
+        "reliability_rate": "21.0%"
+      }
+    },
+    "figure_5_3": {
+      "title": "不同网络环境下的帕累托前沿形态对比",
+      "purpose": "揭示'帕累托坍缩'物理现象",
+      "statistics": {
+        "cloud_pareto_points": 3,
+        "iot_pareto_points": 5,
+        "morphology_difference": "Cloud: Convex curve → IoT: Vertical collapse (帕累托坍缩 -66.7%)"
+      }
+    },
+    "figure_5_4": {
+      "title": "动态膝点检测与权重漂移",
+      "purpose": "展示算法如何自适应找到黄金平衡点",
+      "statistics": {
+        "cloud_knee_point": "Cost=0.20, Time=114.58s",
+        "iot_knee_point": "Cost=0.80, Time=26.85s",
+        "weight_adaptation": "Cloud(1:1) → IoT(3:0.5) 权重自动偏移"
+      }
+    },
+    "figure_5_5": {
+      "title": "多场景性能提升综合对比",
+      "purpose": "量化展示优化效果",
+      "statistics": {
+        "iot_improvement": {
+          "throughput_gain": "+500%",
+          "success_rate_gain": "+31 percentage points",
+          "cost_reduction": "-57%"
+        },
+        "cloud_improvement": {
+          "throughput_gain": "+12%",
+          "success_rate_gain": "+1 percentage point",
+          "cost_reduction": "-62%"
+        }
+      }
+    }
+  },
+  "key_findings": {
+    "theoretical_discovery": "首次发现并验证了'帕累托坍缩'现象：在弱网环境下，传统的成本-效益交换关系失效",
+    "engineering_value": "实现了真正的自适应优化：同一套算法框架在不同网络环境下表现出截然不同的最优策略",
+    "performance_gains": {
+      "iot_network": "弱网环境下吞吐量提升500%，成功率提升31个百分点",
+      "cloud_network": "强网环境下CPU开销降低62.5%，保持高性能的同时显著节能"
+    }
+  }
+}

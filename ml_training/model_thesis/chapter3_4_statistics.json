@@ -1,0 +1,7 @@
+{
+  "full_model_rmse": 26.741021191335772,
+  "single_tower_rmse": 17.219822235784875,
+  "no_attention_rmse": 13.473242910900582,
+  "dual_tower_degradation_percent": -35.605218242883765,
+  "attention_degradation_percent": -49.61582501095365
+}

@@ -1,0 +1,23 @@
+{
+    "Cloud_Fast": {
+        "best_threads": 4,
+        "best_cpu_quota": 1.0,
+        "best_chunk_kb": 256,
+        "expected_throughput": 880.84,
+        "expected_cost": 0.398
+    },
+    "Edge_Normal": {
+        "best_threads": 16,
+        "best_cpu_quota": 2.0,
+        "best_chunk_kb": 256,
+        "expected_throughput": 14.06,
+        "expected_cost": 0.5761
+    },
+    "IoT_Weak": {
+        "best_threads": 1,
+        "best_cpu_quota": 1.0,
+        "best_chunk_kb": 256,
+        "expected_throughput": 0.22,
+        "expected_cost": 0.3881
+    }
+}
