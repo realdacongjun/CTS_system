@@ -2420,18 +2420,28 @@ matplotlib.rcParams['axes.unicode_minus'] = False
 # ==============================================================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 自动查找最新实验数据文件
-data_files = glob.glob(os.path.join(SCRIPT_DIR, "pareto_results*.csv")) + \
-             glob.glob(os.path.join(SCRIPT_DIR, "*cleaned*.csv"))
+# # 自动查找最新实验数据文件
+# data_files = glob.glob(os.path.join(SCRIPT_DIR, "pareto_results*.csv")) + \
+#              glob.glob(os.path.join(SCRIPT_DIR, "*cleaned*.csv"))
 
-if data_files:
-    DATA_FILE = max(data_files, key=os.path.getctime)
-    print(f"📊 检测到数据文件: {os.path.basename(DATA_FILE)} ({len(data_files)} 个候选)")
-else:
-    print("❌ 未找到实验数据文件 (pareto_results_*.csv)")
-    print("💡 请确保目录下存在数据文件，或修改脚本中的 DATA_FILE 路径")
-    # 创建一个示例数据用于测试
-    DATA_FILE = None
+# if data_files:
+#     DATA_FILE = max(data_files, key=os.path.getctime)
+#     print(f"📊 检测到数据文件: {os.path.basename(DATA_FILE)} ({len(data_files)} 个候选)")
+# else:
+#     print("❌ 未找到实验数据文件 (pareto_results_*.csv)")
+#     print("💡 请确保目录下存在数据文件，或修改脚本中的 DATA_FILE 路径")
+#     # 创建一个示例数据用于测试
+#     DATA_FILE = None
+
+# 直接使用指定文件
+DATA_FILE = r"E:\硕士毕业论文材料合集\论文实验代码相关\CTS_system\cags_real_experiment\pareto_results_FINAL_CLEANED.csv"
+
+# 验证文件存在
+if not os.path.exists(DATA_FILE):
+    print(f"❌ 数据文件不存在: {DATA_FILE}")
+    exit(1)
+
+print(f"📊 使用数据文件: {DATA_FILE}")
 
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "innovation_ii_figures_chinese")
 os.makedirs(OUTPUT_DIR, exist_ok=True)

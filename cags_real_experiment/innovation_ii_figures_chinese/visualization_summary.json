@@ -1,46 +1,46 @@
 {
-  "generation_time": "2026-02-12 19:37:22",
-  "data_file": "pareto_cleaned_final.csv",
-  "total_records": 245,
+  "generation_time": "2026-02-12 22:16:25",
+  "data_file": "pareto_results_FINAL_CLEANED.csv",
+  "total_records": 525,
   "figures_generated": 5,
   "figure_summaries": {
     "fig5_1": {
-      "anchor_points": 93,
-      "probe_small_points": 48,
-      "probe_large_points": 101,
-      "total_points": 242
+      "anchor_points": 186,
+      "probe_small_points": 96,
+      "probe_large_points": 202,
+      "total_points": 484
     },
     "fig5_2": {
       "scenarios": 3,
-      "total_configs": 7,
-      "max_cv": 78.50936804315576,
-      "min_cv": 6.16840043771445
+      "total_configs": 11,
+      "max_cv": 126.92178730480926,
+      "min_cv": 6.1395084735521195
     },
     "fig5_3": [
       {
         "scenario": "IoT_Weak",
-        "total_points": 51,
-        "pareto_points": 7
+        "total_points": 102,
+        "pareto_points": 14
       },
       {
         "scenario": "Edge_Normal",
-        "total_points": 21,
-        "pareto_points": 3
+        "total_points": 54,
+        "pareto_points": 6
       },
       {
         "scenario": "Cloud_Fast",
-        "total_points": 45,
-        "pareto_points": 2
+        "total_points": 96,
+        "pareto_points": 7
       }
     ],
     "fig5_4": {
-      "total_points": 45,
-      "pareto_points": 2,
+      "total_points": 96,
+      "pareto_points": 7,
       "knee_points": 3,
       "knee_configs": [
         [
-          4,
-          1.0,
+          2,
+          0.25,
           "节能优先"
         ],
         [
@@ -49,8 +49,8 @@
           "平衡配置"
         ],
         [
-          8,
-          2.0,
+          4,
+          1.0,
           "性能优先"
         ]
       ]
@@ -66,9 +66,9 @@
       },
       {
         "scenario": "Cloud_Fast",
-        "baseline": 195.88666666666666,
+        "baseline": 195.88666666666668,
         "optimal": 233.67666666666665,
-        "improvement": 19.2917673484668,
+        "improvement": 19.291767348466777,
         "unit": "MB/CPU·s",
         "valid": true
       }
