@@ -1,7 +1,0 @@
-{
-  "cftnet_rmse": 72.47709847755732,
-  "best_baseline_rmse": 12.902656874950942,
-  "best_baseline_name": "Random Forest",
-  "rmse_improvement_percent": -461.72228076733137,
-  "cftnet_r2": 0.855198540332038
-}

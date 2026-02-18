@@ -1,0 +1,19 @@
+\begin{table}[htbp]
+\centering
+\caption{模型综合性能对比}
+\label{tab:comparison}
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{Model} & \textbf{R\textsuperscript{2}} & \textbf{sMAPE(\%)} & \textbf{MAE(s)} & \textbf{Corr} & \textbf{PICP-80(\%)} & \textbf{Params(K)} & \textbf{Time(ms)} \\
+\midrule
+CFT-Net & 0.9864 & 5.16 & 8.13 & 0.577 & 80.5 & 17.3 & 0.006 \\
+RandomForest & 0.9905 & 6.60 & 9.10 & - & - & - & 0.106 \\
+XGBoost & 0.9978 & 2.51 & 3.35 & - & - & - & 0.002 \\
+LightGBM & 0.9954 & 2.64 & 4.09 & - & - & - & 0.002 \\
+\bottomrule
+\end{tabular}
+\begin{tablenotes}
+\item[1] R\textsuperscript{2}接近1.0源于传输时间的强物理确定性（大小/带宽）。
+\item[2] CFT-Net是唯一提供不确定性量化的模型（Corr, PICP）。
+\end{tablenotes}
+\end{table}

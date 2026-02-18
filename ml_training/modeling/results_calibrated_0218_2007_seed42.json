@@ -1,0 +1,59 @@
+{
+  "model": "CompactCFT-Net-Calibrated",
+  "num_params": 17316,
+  "seed": 42,
+  "calibration": {
+    "scale_factor": 29.872792243958834,
+    "val_picp_before": 9.994321408290743
+  },
+  "test_metrics": {
+    "mae": 8.127381324768066,
+    "rmse": 22.18034793398553,
+    "smape": 5.1617937088012695,
+    "mape": 5.110188007354736,
+    "corr": 0.6108213937699742,
+    "picp_80_raw": 8.961996596710154,
+    "picp_80_calibrated": 84.23142370958593,
+    "mpiw_raw": 0.6755990730029855,
+    "mpiw_calibrated": 20.182031396872052
+  },
+  "best_val_metrics": {
+    "smape": 5.120589733123779,
+    "mape": 5.086086273193359,
+    "mae": 7.443173408508301,
+    "rmse": 18.523068453725646,
+    "corr": 0.6049386271110242,
+    "ece": 7.180422374025655,
+    "picp_80": 9.994321408290743,
+    "mpiw_80": 0.673457653141511,
+    "epoch": 126
+  },
+  "config": {
+    "lr": 0.0005,
+    "weight_decay": 5e-05,
+    "epochs": 300,
+    "patience": 40,
+    "batch_size": 64,
+    "embed_dim": 32,
+    "nhead": 2,
+    "num_layers": 1,
+    "dim_feedforward": 32,
+    "reg_coeff": 0.005,
+    "warmup_epochs": 30,
+    "alpha_init": 1.1,
+    "beta_init": 0.5,
+    "v_init": 0.1,
+    "picp_target": 0.8,
+    "data_path": "cts_data.xlsx",
+    "feature_path": "image_features_database.csv",
+    "model_save_path": "cts_fixed_0218_2002_seed42.pth",
+    "mape_weight": 0.4,
+    "corr_weight": 0.3,
+    "ece_weight": 0.3,
+    "ema_alpha": 0.9,
+    "winsorize_limits": 0.05,
+    "use_winsorized_for_selection": false,
+    "use_mixup": true,
+    "mixup_alpha": 0.2
+  }
+}

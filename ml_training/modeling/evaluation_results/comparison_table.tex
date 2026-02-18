@@ -1,0 +1,22 @@
+\begin{table}[htbp]
+\centering
+\caption{模型综合性能对比}
+\label{tab:model_comparison}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lccccccccc}
+\toprule
+\textbf{Model} & \textbf{R\textsuperscript{2}} & \textbf{sMAPE(\%)} & \textbf{RMSE(s)} & \textbf{Corr} & \textbf{PICP-80(\%)} & \textbf{MPIW(s)} & \textbf{ECE} & \textbf{Params(K)} & \textbf{Time(ms)} \\
+\midrule
+CFT-Net & 0.9966 & 4.47 & 11.07 & 0.764 & 82.1 & 18.97 & 1.606 & 174.3 & 0.018 \\
+RandomForest & 0.9947 & 6.45 & 13.86 & - & - & - & - & - & 0.091 \\
+XGBoost & 0.9985 & 2.83 & 7.50 & - & - & - & - & - & 0.002 \\
+LightGBM & 0.9984 & 2.55 & 7.55 & - & - & - & - & - & 0.002 \\
+\bottomrule
+\end{tabular}
+}
+\begin{tablenotes}
+\footnotesize
+\item[1] R\textsuperscript{2} 接近1.0源于传输时间的强物理确定性（文件大小/带宽）。
+\item[2] Corr、PICP、MPIW、ECE 为不确定性量化专属指标，传统树模型无法提供。
+\end{tablenotes}
+\end{table}
