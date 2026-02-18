@@ -1,0 +1,14 @@
+Variant,sMAPE (%),Corr,PICP-80 (%)
+Ours (Full),5.40,0.673,83.3
+w/o EDL,7.30,N/A,N/A
+w/o Transformer,5.11,0.381,66.4
+w/o Mixup,10.40,0.675,42.7
+Dual-Tower + FTTransformer,7.70,0.494,56.2
+
+
+实验变体 (Variant),精度 (sMAPE),绝对误差 (MAE),风险感知 (Corr),可靠性 (PICP / MPIW),效率 (Params)
+Ours (Full),5.40%,8.81s,0.673,83.3% / 21.5s,17 K
+w/o EDL,7.30%,12.4s,N/A,N/A,17 K
+w/o Transformer,5.11%,8.5s,0.381 (📉),66.4% / 15.2s,12 K
+w/o Mixup,10.40%,18.2s,0.675,42.7% / 9.8s (❌),17 K
+Dual-Tower (FT),7.70%,13.5s,0.494,56.2% / 18.1s,>200 K
