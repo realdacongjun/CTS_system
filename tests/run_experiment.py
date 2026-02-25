@@ -693,30 +693,88 @@ def main():
     infra = LabInfrastructure()
     orch = ExperimentOrchestrator(infra)
     
-    # 运行模式选择
-    print("\n请选择运行模式:")
-    print("  1. 运行全部五大实验（预计4-6小时，推荐评优/发论文使用）")
-    print("  2. 仅运行实验一（端到端闭环验证，预计1小时，快速验证）")
-    print("  3. 运行实验一+实验二（核心创新验证，预计2小时）")
-    print("  4. 仅运行实验四+实验五（轻量化+长稳验证）")
+    # ==========================================
+    # 【升级】全功能菜单逻辑
+    # ==========================================
+    import sys
     
-    choice = input("\n请输入选项 [1]: ").strip() or "1"
+    # 检测是否为交互式终端
+    is_interactive = sys.stdin.isatty()
     
+    if is_interactive:
+        # 交互式模式：显示详细菜单
+        print("\n" + "="*60)
+        print("请选择要运行的实验:")
+        print("  0. 运行全部五大实验 (预计4-6小时)")
+        print("-" * 40)
+        print("  1. 仅运行 [实验一]: 端到端核心性能基准")
+        print("  2. 仅运行 [实验二]: 双创新点协同增益消融")
+        print("  3. 仅运行 [实验三]: 动态环境鲁棒性与风险防控")
+        print("  4. 仅运行 [实验四]: 端侧轻量化部署验证")
+        print("  5. 仅运行 [实验五]: 长稳压力测试")
+        print("-" * 40)
+        print("  组合模式:")
+        print("  12. 实验一 + 实验二 (核心创新验证)")
+        print("  45. 实验四 + 实验五 (部署与稳定性)")
+        print("="*60)
+        
+        choice = input("\n请输入选项编号 [1]: ").strip() or "1"
+    else:
+        # 非交互式模式 (后台运行)
+        print("\n🔧 检测到非交互式环境 (后台运行)")
+        # ==========================================
+        # 【修改区】在这里设置后台默认运行的实验:
+        # 可选值: "0", "1", "2", "3", "4", "5", "12", "45"
+        # ==========================================
+        default_choice = "0" 
+        print(f"   自动执行选项: {default_choice}")
+        choice = default_choice
+    
+    # ==========================================
+    # 执行路由
+    # ==========================================
     try:
-        if choice == "1":
+        if choice == "0":
+            print("\n🏃 开始运行全部五大实验...")
             orch.run_exp1_end2end()
             orch.run_exp2_ablation()
             orch.run_exp3_robustness()
             orch.run_exp4_lightweight()
             orch.run_exp5_stability()
-        elif choice == "2":
+            
+        elif choice == "1":
+            print("\n🏃 开始运行 [实验一]: 端到端核心性能基准...")
             orch.run_exp1_end2end()
+            
+        elif choice == "2":
+            print("\n🏃 开始运行 [实验二]: 双创新点协同增益消融...")
+            orch.run_exp2_ablation()
+            
         elif choice == "3":
+            print("\n🏃 开始运行 [实验三]: 动态环境鲁棒性与风险防控...")
+            orch.run_exp3_robustness()
+            
+        elif choice == "4":
+            print("\n🏃 开始运行 [实验四]: 端侧轻量化部署验证...")
+            orch.run_exp4_lightweight()
+            
+        elif choice == "5":
+            print("\n🏃 开始运行 [实验五]: 长稳压力测试...")
+            orch.run_exp5_stability()
+            
+        elif choice == "12":
+            print("\n🏃 开始运行 [实验一 + 实验二]...")
             orch.run_exp1_end2end()
             orch.run_exp2_ablation()
-        elif choice == "4":
+            
+        elif choice == "45":
+            print("\n🏃 开始运行 [实验四 + 实验五]...")
             orch.run_exp4_lightweight()
             orch.run_exp5_stability()
+            
+        else:
+            print(f"❌ 未知选项: {choice}，默认运行实验一")
+            orch.run_exp1_end2end()
             
         # 生成统计报告
         csv_file = orch._save_results()
@@ -732,7 +790,7 @@ def main():
         orch._save_results()
     finally:
         infra.cleanup()
-        print("\n🏁 所有实验流程结束")
+        print("\n🏁 实验流程结束")
 
 if __name__ == "__main__":
     main()
