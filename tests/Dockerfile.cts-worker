@@ -1,0 +1,10 @@
+FROM docker:25-dind
+
+# 【可选】如果你在国内，加上这行换阿里源，飞快
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
+
+# 提前安装好 skopeo
+RUN apk add --no-cache skopeo
+
+# 打印版本确认
+RUN skopeo --version
