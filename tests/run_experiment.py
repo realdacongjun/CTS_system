@@ -803,7 +803,7 @@ import subprocess
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import psutil
 from scipy import stats
 
@@ -833,7 +833,6 @@ BASELINE_STATIC_CONFIG = {
 # 1. 导入
 # ==========================================
 try:
-    # 只导入模型类，不修改
     from cts_model import CompactCFTNetV2, CONFIG as MODEL_CONFIG
     from cags_decision import CAGSDecisionEngine
 except ImportError as e:
@@ -844,17 +843,46 @@ import torch
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ==========================================
-# 2. 基础设施
+# 2. 基础设施（完整修复版）
 # ==========================================
 class LabInfrastructure:
     def __init__(self):
         self.net_name = "cts-net"
         self.client_container = "cts-client-worker"
+        self.skopeo_supports_threads = False
+        self.skopeo_supports_chunk = False
+        self._create_network()
         self._init_model()
         self.current_worker_cpu_max = 8.0
 
+    def _create_network(self):
+        """自动创建Docker网络"""
+        try:
+            result = subprocess.run(
+                f"docker network inspect {self.net_name}",
+                shell=True, capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                print(f"✅ 网络 {self.net_name} 已存在")
+                return True
+        except:
+            pass
+        
+        print(f"🔧 创建Docker网络: {self.net_name}")
+        try:
+            subprocess.run(
+                f"docker network create --driver bridge {self.net_name}",
+                shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            print(f"✅ 网络创建成功")
+            time.sleep(1)
+            return True
+        except Exception as e:
+            print(f"❌ 网络创建失败: {e}")
+            return False
+
     def _init_model(self):
-        """加载模型 - 完全兼容原模型"""
+        """加载CTS模型"""
         print("🧠 加载CTS模型...")
         
         if not os.path.exists(PREP_PATH):
@@ -871,7 +899,6 @@ class LabInfrastructure:
         self.cols_c = prep['cols_c']
         self.cols_i = prep['cols_i']
 
-        # 使用原模型配置创建实例
         self.model = CompactCFTNetV2(
             client_feats=len(self.cols_c),
             image_feats=len(self.cols_i),
@@ -879,13 +906,11 @@ class LabInfrastructure:
             embed_dim=MODEL_CONFIG.get("embed_dim", 64)
         )
         
-        # 加载权重
         state_dict = torch.load(MODEL_PATH, map_location=device)
         self.model.load_state_dict(state_dict)
         self.model = self.model.to(device)
         self.model.eval()
         
-        # 创建决策引擎
         self.engine = CAGSDecisionEngine(
             self.model, self.scaler_c, self.scaler_i,
             self.enc, self.cols_c, self.cols_i, device
@@ -893,7 +918,7 @@ class LabInfrastructure:
         
         print(f"✅ 模型加载完成")
 
-    def _get_bridge_iface(self):
+    def _get_bridge_iface(self) -> Optional[str]:
         """获取网桥接口"""
         try:
             res = subprocess.check_output(
@@ -901,29 +926,38 @@ class LabInfrastructure:
                 shell=True, text=True
             )
             net_data = json.loads(res)
-            bridge_id = net_data[0]['Id'][:12]
-            return f"br-{bridge_id}"
-        except:
+            
+            bridge_id = net_data[0].get('Id', '')[:12]
+            if bridge_id:
+                return f"br-{bridge_id}"
+            
+            options = net_data[0].get('Options', {})
+            bridge_name = options.get('com.docker.network.bridge.name')
+            if bridge_name:
+                return bridge_name
+                
+            return None
+        except Exception as e:
+            print(f"⚠️  获取网桥失败: {e}")
             return None
 
-    def set_network(self, bw_mbps: float, delay_ms: float, loss_pct: float):
-        """配置网络"""
+    def set_network(self, bw_mbps: float, delay_ms: float, loss_pct: float) -> bool:
+        """配置网络tc规则"""
         iface = self._get_bridge_iface()
         if not iface:
+            print("⚠️  跳过网络配置（无法获取网桥）")
             return False
         
-        # 清除旧规则
         subprocess.run(
             f"sudo tc qdisc del dev {iface} root 2>/dev/null", 
             shell=True, stderr=subprocess.DEVNULL
         )
         
-        # 添加新规则
         cmd = (
             f"sudo tc qdisc add dev {iface} root handle 1: htb default 11 && "
-            f"sudo tc class add dev {iface} parent 1: classid 1:1 htb rate {bw_mbps}mbit && "
+            f"sudo tc class add dev {iface} parent 1: classid 1:1 htb rate {bw_mbps}mbit ceil {bw_mbps}mbit && "
             f"sudo tc qdisc add dev {iface} parent 1:1 handle 10: "
-            f"netem delay {delay_ms}ms loss {loss_pct}%"
+            f"netem delay {delay_ms}ms loss {loss_pct}% limit 1000"
         )
         
         try:
@@ -935,11 +969,10 @@ class LabInfrastructure:
             print(f"   ⚠️  网络配置失败: {e}")
             return False
 
-    def start_worker(self, max_cpu: float, mem: str):
-        """启动工作容器"""
+    def start_worker(self, max_cpu: float, mem: str) -> bool:
+        """启动工作容器并安装skopeo"""
         self.current_worker_cpu_max = max_cpu
         
-        # 清理
         subprocess.run(
             f"docker rm -f {self.client_container} 2>/dev/null",
             shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -953,18 +986,70 @@ class LabInfrastructure:
         
         try:
             subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL)
-            time.sleep(5)
+            print(f"   🐳 容器启动中...", end="", flush=True)
             
-            # 安装skopeo
-            subprocess.run(
-                f"docker exec {self.client_container} apk add --no-cache skopeo",
-                shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            print(f"   🐳 容器启动: CPU={max_cpu} | MEM={mem}")
+            # 等待Docker-in-Docker就绪
+            for i in range(30):
+                time.sleep(1)
+                check = subprocess.run(
+                    f"docker exec {self.client_container} docker version",
+                    shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                if check.returncode == 0:
+                    print(f" OK ({i+1}s)")
+                    break
+            else:
+                print(" 超时")
+                return False
+            
+            self._install_skopeo()
             return True
+            
         except Exception as e:
-            print(f"   ❌ 容器启动失败: {e}")
+            print(f"\n   ❌ 容器启动失败: {e}")
             return False
+
+    def _install_skopeo(self):
+        """【修复】安装skopeo并严格检测版本能力"""
+        print(f"   📦 安装skopeo...", end="", flush=True)
+        
+        # 尝试edge仓库安装新版
+        install_cmd = (
+            f"docker exec {self.client_container} sh -c '"
+            f"echo \"https://dl-cdn.alpinelinux.org/alpine/edge/community\" >> /etc/apk/repositories && "
+            f"apk update -q 2>/dev/null && "
+            f"apk add --no-cache skopeo -q'"
+        )
+        
+        result = subprocess.run(install_cmd, shell=True, capture_output=True, text=True, timeout=120)
+        
+        install_ok = (result.returncode == 0)
+        if not install_ok:
+            print(f"\n   ⚠️  edge源失败，尝试默认源...", end="", flush=True)
+            fallback = f"docker exec {self.client_container} apk add --no-cache skopeo -q"
+            result2 = subprocess.run(fallback, shell=True, capture_output=True, text=True, timeout=60)
+            install_ok = (result2.returncode == 0)
+        
+        if not install_ok:
+            print(f"\n   ❌ skopeo安装失败")
+            self.skopeo_supports_threads = False
+            self.skopeo_supports_chunk = False
+            return
+        
+        # 【关键修复】严格检测 - 实际运行help命令
+        print(f" 检测中...", end="", flush=True)
+        help_result = subprocess.run(
+            f"docker exec {self.client_container} skopeo copy --help 2>&1",
+            shell=True, capture_output=True, text=True
+        )
+        
+        help_text = help_result.stdout + help_result.stderr
+        
+        # 严格检查标志
+        self.skopeo_supports_threads = "--max-concurrent-downloads" in help_text
+        self.skopeo_supports_chunk = "--chunk-size" in help_text
+        
+        print(f" threads={self.skopeo_supports_threads}, chunk={self.skopeo_supports_chunk}")
 
     def _set_cpu_quota(self, quota: float):
         """动态调整CPU配额"""
@@ -978,36 +1063,45 @@ class LabInfrastructure:
         except Exception as e:
             print(f"   ⚠️  CPU调整失败: {e}")
 
-    def pull_image(self, image: str, config: Dict) -> Tuple[float, bool, float]:
+    def pull_image(self, image: str, config: Dict, timeout: int = 300) -> Tuple[float, bool, float]:
         """
-        执行镜像拉取
-        :return: (时间, 成功, 峰值CPU)
+        【完整修复】执行镜像拉取 - 严格根据检测到的能力构建命令
         """
-        # 应用CPU配额
         self._set_cpu_quota(config['cpu_quota'])
         
-        # 构造skopeo命令
-        cmd = (
-            f"skopeo copy --override-os linux --override-arch amd64 "
-            f"--max-concurrent-downloads {config['threads']} "
-            f"--chunk-size {config['chunk_size_kb']}KB "
-            f"--compression-format {config['algo_name']} "
-            f"docker://docker.io/{image} docker-daemon:{image}"
-        )
+        # 【关键修复】严格根据检测到的能力构建命令
+        flags = ["--override-os linux", "--override-arch amd64"]
         
-        # 清理镜像缓存
+        # 调试信息
+        print(f"      🔧 skopeo: threads={self.skopeo_supports_threads}, chunk={self.skopeo_supports_chunk}")
+        
+        if self.skopeo_supports_threads:
+            flags.append(f"--max-concurrent-downloads {int(config['threads'])}")
+        else:
+            print(f"      ⚠️  跳过 --max-concurrent-downloads (不支持)")
+        
+        if self.skopeo_supports_chunk:
+            flags.append(f"--chunk-size {int(config['chunk_size_kb'])}KB")
+        else:
+            print(f"      ⚠️  跳过 --chunk-size (不支持)")
+        
+        flags.append(f"--compression-format {config['algo_name']}")
+        
+        skopeo_cmd = f"skopeo copy {' '.join(flags)} docker://docker.io/{image} docker-daemon:{image}"
+        
+        # 清理镜像
         subprocess.run(
             f"docker exec {self.client_container} docker rmi {image} 2>/dev/null",
             shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         time.sleep(0.5)
         
-        # 执行拉取
+        # 【修复】正确计时
         start = time.time()
         peak_cpu = 0.0
         
         proc = subprocess.Popen(
-            f"docker exec {self.client_container} {cmd}",
+            f"docker exec {self.client_container} {skopeo_cmd}",
             shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         
@@ -1022,22 +1116,38 @@ class LabInfrastructure:
                     peak_cpu = max(peak_cpu, float(stats))
             except:
                 pass
+            
             time.sleep(0.2)
+            
+            # 超时检查
+            if time.time() - start > timeout:
+                proc.kill()
+                print(f"      ⏱️  超时({timeout}s)")
+                break
         
-        elapsed = time.time() - start
+        # 等待进程结束
         stdout, stderr = proc.communicate()
+        elapsed = time.time() - start
         success = (proc.returncode == 0)
         
-        if not success:
-            print(f"      ❌ 失败: {stderr[:150]}")
+        # 处理错误
+        err_msg = ""
+        if stderr:
+            err_msg = stderr.decode() if isinstance(stderr, bytes) else str(stderr)
+            if not success:
+                err_short = err_msg[:200].replace('\n', ' ')
+                print(f"      ❌ {err_short}")
         
-        # 重置CPU
         self._set_cpu_quota(self.current_worker_cpu_max)
+        
+        # 【修复】如果失败且时间过短，可能是立即失败，标记为0
+        if not success and elapsed < 2.0:
+            print(f"      ⚠️  快速失败 (可能命令错误)，耗时={elapsed:.2f}s")
         
         return elapsed, success, peak_cpu
 
     def get_image_features(self, image: str) -> Dict:
-        """获取镜像特征 - 确保包含所有必要字段"""
+        """获取镜像特征"""
         size_map = {
             "alpine:3.19": 5,
             "nginx:1.25-alpine": 15,
@@ -1045,7 +1155,6 @@ class LabInfrastructure:
         }
         size = size_map.get(image, 50)
         
-        # 必须包含所有训练时使用的特征
         return {
             'total_size_mb': size,
             'avg_layer_entropy': 0.65,
@@ -1056,36 +1165,51 @@ class LabInfrastructure:
             'zero_ratio': 0.05
         }
 
-    def cleanup(self):
+    def cleanup(self, keep_network: bool = True):
         """清理环境"""
         print("\n🧹 清理环境...")
+        
         subprocess.run(
             f"docker rm -f {self.client_container} 2>/dev/null",
             shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
+        print("   ✅ 容器已删除")
+        
         iface = self._get_bridge_iface()
         if iface:
             subprocess.run(
                 f"sudo tc qdisc del dev {iface} root 2>/dev/null",
                 shell=True, stderr=subprocess.DEVNULL
             )
-        print("   ✅ 完成")
+            print("   ✅ 网络规则已清除")
+        
+        if not keep_network:
+            subprocess.run(
+                f"docker network rm {self.net_name} 2>/dev/null",
+                shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            print("   ✅ 网络已删除")
+        
+        print("   ✅ 环境清理完成")
 
 # ==========================================
-# 3. 实验编排
+# 3. 实验编排器
 # ==========================================
 class ExperimentOrchestrator:
     def __init__(self, infra: LabInfrastructure):
         self.infra = infra
         self.results = []
         self.start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.repeat = 3  # 重复次数
+        self.repeat = 3
 
     def _log(self, exp: str, scene: str, method: str, image: str,
-             time_s: float, ok: bool, cpu: float, cfg: Dict, extra: Dict = None):
-        """记录结果"""
+             time_s: float, ok: bool, cpu: float, cfg: Dict, extra: Optional[Dict] = None):
+        """记录实验结果"""
         extra = extra or {}
         size = self.infra.get_image_features(image)['total_size_mb']
+        
+        # 【修复】如果失败，吞吐量标记为0避免虚假高速率
+        throughput = 0.0 if not ok else (size * 8) / max(time_s, 0.001)
         
         row = {
             'timestamp': datetime.now().isoformat(),
@@ -1097,30 +1221,35 @@ class ExperimentOrchestrator:
             'time_s': time_s,
             'success': ok,
             'cpu_pct': cpu,
-            'throughput_mbps': (size * 8) / max(time_s, 0.001),
+            'throughput_mbps': throughput,
+            'cpu_efficiency': 0.0 if not ok else size / (cpu * time_s / 100 + 0.001),
             'config': json.dumps(cfg),
+            'skopeo_threads_support': self.infra.skopeo_supports_threads,
+            'skopeo_chunk_support': self.infra.skopeo_supports_chunk,
         }
         row.update(extra)
         self.results.append(row)
         
         status = "✅" if ok else "❌"
-        print(f"   {status} {method:12s} | {image:20s} | {time_s:6.2f}s | {row['throughput_mbps']:7.2f}Mbps")
+        tp_str = f"{throughput:7.2f}" if ok else "   N/A"
+        print(f"   {status} {method:12s} | {image:20s} | {time_s:6.2f}s | {tp_str}Mbps")
 
     def _save(self):
         """保存结果"""
+        if not self.results:
+            print("⚠️  无数据可保存")
+            return None
+            
         df = pd.DataFrame(self.results)
         path = os.path.join(RESULT_DIR, f"results_{self.start_time}.csv")
-        df.to_csv(path, index=False)
-        print(f"\n💾 保存: {path}")
+        df.to_csv(path, index=False, encoding='utf-8-sig')
+        print(f"\n💾 保存: {path} ({len(df)}条记录)")
         return path
 
-    # --------------------------------------
-    # 实验1: 端到端
-    # --------------------------------------
     def exp1_end2end(self):
-        print("\n" + "="*60)
+        print("\n" + "="*70)
         print("🧪 实验1: 端到端性能基准")
-        print("="*60)
+        print("="*70)
         
         scenes = [
             {"name": "IoT_Weak", "cpu": 2.0, "mem": "2g", "bw": 2, "delay": 100, "loss": 2},
@@ -1147,12 +1276,10 @@ class ExperimentOrchestrator:
                 for img in TEST_IMAGES:
                     feat = self.infra.get_image_features(img)
                     
-                    # 基线
                     base_cfg = BASELINE_STATIC_CONFIG[s['name']]
                     t, ok, cpu = self.infra.pull_image(img, base_cfg)
                     self._log("Exp1", s['name'], "Static", img, t, ok, cpu, base_cfg)
                     
-                    # CTS
                     try:
                         cts_cfg, metrics, _ = self.infra.engine.make_decision(env, feat)
                     except Exception as e:
@@ -1166,13 +1293,10 @@ class ExperimentOrchestrator:
         
         self._save()
 
-    # --------------------------------------
-    # 实验2: 消融
-    # --------------------------------------
     def exp2_ablation(self):
-        print("\n" + "="*60)
+        print("\n" + "="*70)
         print("🧪 实验2: 消融实验")
-        print("="*60)
+        print("="*70)
         
         scene = {"name": "Edge", "cpu": 4.0, "mem": "8g", "bw": 20, "delay": 30, "loss": 0.5}
         
@@ -1189,7 +1313,7 @@ class ExperimentOrchestrator:
         
         variants = [
             ("Static", False, False),
-            ("CFT_Only", False, False),  # 使用CFT但不使用CAGS特性
+            ("CFT_Only", False, False),
             ("CFT+Unc", True, False),
             ("CFT+CAGS", False, True),
             ("CFT+Unc+CAGS", True, True),
@@ -1221,13 +1345,10 @@ class ExperimentOrchestrator:
         
         self._save()
 
-    # --------------------------------------
-    # 实验3: 鲁棒性
-    # --------------------------------------
     def exp3_robust(self):
-        print("\n" + "="*60)
+        print("\n" + "="*70)
         print("🧪 实验3: 鲁棒性测试")
-        print("="*60)
+        print("="*70)
         
         if not self.infra.start_worker(4.0, "8g"):
             return
@@ -1236,8 +1357,7 @@ class ExperimentOrchestrator:
         feat = self.infra.get_image_features(img)
         base_env = {'cpu_limit': 4.0, 'mem_limit_mb': 8192, 'network_rtt': 30}
         
-        # 动态波动
-        print("\n📍 动态波动")
+        print("\n📍 动态波动场景")
         np.random.seed(42)
         for i in range(15):
             bw = np.random.uniform(2, 25)
@@ -1245,23 +1365,23 @@ class ExperimentOrchestrator:
             self.infra.set_network(bw, 30, loss)
             env = {**base_env, 'bandwidth_mbps': bw}
             
-            # 静态
             t, ok, cpu = self.infra.pull_image(img, BASELINE_STATIC_CONFIG['Edge_Net'])
-            self._log("Exp3", "Dynamic", "Static", img, t, ok, cpu, BASELINE_STATIC_CONFIG['Edge_Net'], {"bw": bw})
+            self._log("Exp3", "Dynamic", "Static", img, t, ok, cpu, 
+                     BASELINE_STATIC_CONFIG['Edge_Net'], {"bw": round(bw, 1)})
             
-            # CTS
             cfg, meta, _ = self.infra.engine.make_decision(env, feat)
             t, ok, cpu = self.infra.pull_image(img, cfg)
-            self._log("Exp3", "Dynamic", "CTS", img, t, ok, cpu, cfg, {**meta, "bw": bw})
+            self._log("Exp3", "Dynamic", "CTS", img, t, ok, cpu, cfg, 
+                     {**meta, "bw": round(bw, 1)})
         
-        # OOD
-        print("\n📍 OOD极端")
+        print("\n📍 OOD极端弱网")
         self.infra.set_network(0.5, 500, 15)
         env = {**base_env, 'bandwidth_mbps': 0.5, 'network_rtt': 500}
         
         for _ in range(5):
             t, ok, cpu = self.infra.pull_image(img, BASELINE_STATIC_CONFIG['IoT_Weak'])
-            self._log("Exp3", "OOD", "Static", img, t, ok, cpu, BASELINE_STATIC_CONFIG['IoT_Weak'])
+            self._log("Exp3", "OOD", "Static", img, t, ok, cpu, 
+                     BASELINE_STATIC_CONFIG['IoT_Weak'])
             
             cfg, meta, _ = self.infra.engine.make_decision(env, feat)
             t, ok, cpu = self.infra.pull_image(img, cfg)
@@ -1269,13 +1389,10 @@ class ExperimentOrchestrator:
         
         self._save()
 
-    # --------------------------------------
-    # 实验4: 轻量化
-    # --------------------------------------
     def exp4_light(self):
-        print("\n" + "="*60)
-        print("🧪 实验4: 轻量化")
-        print("="*60)
+        print("\n" + "="*70)
+        print("🧪 实验4: 轻量化部署")
+        print("="*70)
         
         if not self.infra.start_worker(2.0, "2g"):
             return
@@ -1284,7 +1401,7 @@ class ExperimentOrchestrator:
         env = {'bandwidth_mbps': 2, 'cpu_limit': 2.0, 'network_rtt': 100, 'mem_limit_mb': 2048}
         feat = self.infra.get_image_features("alpine:3.19")
         
-        # 测试延迟
+        print("   测试决策延迟...")
         latencies = []
         for _ in range(50):
             t0 = time.time()
@@ -1292,14 +1409,13 @@ class ExperimentOrchestrator:
             latencies.append((time.time() - t0) * 1000)
         
         stats = {
-            'latency_mean_ms': np.mean(latencies),
-            'latency_p99_ms': np.percentile(latencies, 99),
+            'latency_mean_ms': round(np.mean(latencies), 2),
+            'latency_p99_ms': round(np.percentile(latencies, 99), 2),
             'model_params': sum(p.numel() for p in self.infra.model.parameters()),
-            'memory_mb': psutil.Process().memory_info().rss / 1024 / 1024
+            'memory_mb': round(psutil.Process().memory_info().rss / 1024 / 1024, 2)
         }
-        print(f"\n📊 延迟: {stats['latency_mean_ms']:.2f}ms (P99: {stats['latency_p99_ms']:.2f}ms)")
+        print(f"   📊 延迟: {stats['latency_mean_ms']}ms (P99: {stats['latency_p99_ms']}ms)")
         
-        # 执行测试
         for _ in range(self.repeat):
             cfg, meta, _ = self.infra.engine.make_decision(env, feat)
             t, ok, cpu = self.infra.pull_image("alpine:3.19", cfg)
@@ -1307,13 +1423,10 @@ class ExperimentOrchestrator:
         
         self._save()
 
-    # --------------------------------------
-    # 实验5: 长稳
-    # --------------------------------------
     def exp5_stability(self):
-        print("\n" + "="*60)
-        print("🧪 实验5: 长稳测试")
-        print("="*60)
+        print("\n" + "="*70)
+        print("🧪 实验5: 长稳压力测试")
+        print("="*70)
         
         if not self.infra.start_worker(8.0, "16g"):
             return
@@ -1334,58 +1447,65 @@ class ExperimentOrchestrator:
         print(f"\n   稳定性: 首10次={np.mean(times[:10]):.2f}s, 末10次={np.mean(times[-10:]):.2f}s")
         self._save()
 
-    # --------------------------------------
-    # 统计报告
-    # --------------------------------------
-    def report(self, csv_path):
-        print("\n" + "="*60)
+    def report(self, csv_path: str):
+        """生成统计报告"""
+        print("\n" + "="*70)
         print("📊 统计报告")
-        print("="*60)
+        print("="*70)
         
         df = pd.read_csv(csv_path)
         
-        # Exp1分析
         exp1 = df[df['experiment'] == 'Exp1']
         if len(exp1) > 0:
-            print("\n🎯 端到端性能:")
+            print("\n🎯 端到端性能提升:")
             for scene in exp1['scene'].unique():
                 s_df = exp1[exp1['scene'] == scene]
-                base = s_df[s_df['method'] == 'Static']['throughput_mbps']
-                cts = s_df[s_df['method'] == 'CTS']['throughput_mbps']
+                base = s_df[s_df['method'] == 'Static']
+                cts = s_df[s_df['method'] == 'CTS']
                 
-                if len(base) > 0 and len(cts) > 0:
-                    gain = (cts.mean() - base.mean()) / base.mean() * 100
-                    _, p = stats.ttest_ind(base, cts)
+                # 只统计成功的
+                base_ok = base[base['success'] == True]
+                cts_ok = cts[cts['success'] == True]
+                
+                if len(base_ok) > 0 and len(cts_ok) > 0:
+                    gain = (cts_ok['throughput_mbps'].mean() - base_ok['throughput_mbps'].mean()) / base_ok['throughput_mbps'].mean() * 100
+                    _, p = stats.ttest_ind(base_ok['throughput_mbps'], cts_ok['throughput_mbps'])
                     sig = "✅" if p < 0.05 else "❌"
-                    print(f"   [{scene:12s}] 提升: {gain:+6.2f}% | p={p:.4f} {sig}")
+                    print(f"   [{scene:12s}] +{gain:6.2f}% | p={p:.4f} {sig}")
+                else:
+                    print(f"   [{scene:12s}] 数据不足 (base={len(base_ok)}, cts={len(cts_ok)})")
+        
+        print("\n🔧 skopeo支持情况:")
+        print(f"   threads: {self.infra.skopeo_supports_threads}")
+        print(f"   chunk:   {self.infra.skopeo_supports_chunk}")
 
 # ==========================================
 # 4. 主函数
 # ==========================================
 def main():
-    print("🚀 CTS闭环实验平台")
+    print("🚀 CTS闭环实验平台 v2.1 (网络+skopeo修复版)")
     
-    # 检查sudo
     try:
         subprocess.run("sudo -v", shell=True, check=True, 
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("✅ sudo权限正常")
     except:
-        print("❌ 需要sudo权限")
+        print("❌ 需要sudo权限: sudo python3 run_master.py")
         sys.exit(1)
     
-    # 初始化
     try:
         infra = LabInfrastructure()
     except Exception as e:
         print(f"❌ 初始化失败: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
     
     orch = ExperimentOrchestrator(infra)
     
-    # 菜单
     menu = {
-        "0": ("全部", [orch.exp1_end2end, orch.exp2_ablation, 
-                     orch.exp3_robust, orch.exp4_light, orch.exp5_stability]),
+        "0": ("全部实验", [orch.exp1_end2end, orch.exp2_ablation, 
+                         orch.exp3_robust, orch.exp4_light, orch.exp5_stability]),
         "1": ("实验1-端到端", [orch.exp1_end2end]),
         "2": ("实验2-消融", [orch.exp2_ablation]),
         "3": ("实验3-鲁棒性", [orch.exp3_robust]),
@@ -1394,7 +1514,7 @@ def main():
     }
     
     if sys.stdin.isatty():
-        print("\n选择:")
+        print("\n选择实验:")
         for k, (name, _) in menu.items():
             print(f"  {k}. {name}")
         choice = input("> ").strip() or "0"
@@ -1402,17 +1522,17 @@ def main():
         choice = "0"
         print("自动执行全部实验")
     
-    # 执行
     try:
         for fn in menu.get(choice, menu["0"])[1]:
             fn()
         
         if orch.results:
             path = orch._save()
-            orch.report(path)
+            if path:
+                orch.report(path)
             
     except KeyboardInterrupt:
-        print("\n⏹️ 中断")
+        print("\n⏹️ 用户中断")
     except Exception as e:
         print(f"\n❌ 错误: {e}")
         import traceback
