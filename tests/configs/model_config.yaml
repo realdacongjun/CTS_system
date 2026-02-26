@@ -1,0 +1,17 @@
+# CFT-Net模型配置
+model:
+  model_path: "./models/cts_optimized_0218_2125_seed42.pth"  # 使用已有模型
+  preprocess_path: "./models/preprocessing_objects_optimized.pkl"  # 使用已有预处理对象
+  device: "cuda"  # 或 "cpu"
+
+# CAGS决策引擎配置
+decision_engine:
+  safety_threshold: 0.5
+  enable_uncertainty: true
+  enable_dpc: true
+
+# 性能阈值配置
+performance_thresholds:
+  min_throughput_mbps: 1.0
+  max_pull_time_seconds: 300
+  min_success_rate: 0.95
