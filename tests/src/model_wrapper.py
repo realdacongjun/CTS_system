@@ -6,6 +6,7 @@ import logging
 import time
 import yaml
 from typing import Dict, Any, Tuple, List, Optional
+from pathlib import Path
 
 # 添加上级目录到路径
 import sys
@@ -21,11 +22,26 @@ class CFTNetWrapper:
             model_config_path: 模型配置文件路径
         """
         # 1. 加载配置
-        with open(model_config_path, 'r', encoding='utf-8') as f:
+        # 【修复】确保路径是相对于项目根目录，或者转为绝对路径
+        config_path = Path(model_config_path)
+        if not config_path.is_absolute():
+            # 如果传入的是相对路径，假设是相对于项目根目录
+            # 或者相对于当前文件所在目录
+            # 这里我们假设是相对于项目根目录
+            pass
+            
+        with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
         
-        self.model_path = self.config['model']['model_path']
-        self.preprocess_path = self.config['model']['preprocess_path']
+        # 【修复】处理模型文件路径
+        # 如果配置里是相对路径，把它变成相对于 config 文件所在的目录
+        base_dir = config_path.parent
+        
+        model_path_raw = self.config['model']['model_path']
+        preprocess_path_raw = self.config['model']['preprocess_path']
+        
+        self.model_path = str((base_dir / model_path_raw).resolve())
+        self.preprocess_path = str((base_dir / preprocess_path_raw).resolve())
         
         # 2. 设备自动选择 (优化点1: 自动回退CPU)
         requested_device = self.config['model'].get('device', 'cpu')
@@ -67,14 +83,24 @@ class CFTNetWrapper:
             # -----------------------------------------------------------
             self.logger.info(f"   正在导入模型类...")
             try:
-                from cts_model import CompactCFTNetV2
+                # 方案B：更稳健的绝对导入 (推荐)
+                import importlib.util
+                from pathlib import Path
+                # 假设 cts_model.py 和当前文件在同一个目录
+                cts_model_path = Path(__file__).parent / "cts_model.py"
+                
+                spec = importlib.util.spec_from_file_location("cts_model", cts_model_path)
+                cts_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(cts_module)
+                
+                CompactCFTNetV2 = cts_module.CompactCFTNetV2
                 self.model_class = CompactCFTNetV2
-            except ImportError:
+                
+            except Exception as e:
                 raise ImportError(
-                    "❌ 无法导入 CompactCFTNetV2。\n"
-                    "   请确保：\n"
-                    "   1. 包含模型类的文件名为 cts_model.py\n"
-                    "   2. 该文件在 Python 路径中 (通常是项目根目录)"
+                    f"❌ 无法导入 CompactCFTNetV2。\n"
+                    f"   错误: {e}\n"
+                    f"   请确保 cts_model.py 在 src/ 目录下。"
                 )
             
             # -----------------------------------------------------------

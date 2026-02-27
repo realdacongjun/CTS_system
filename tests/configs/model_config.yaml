@@ -1,17 +1,20 @@
 # CFT-Net模型配置
 model:
-  model_path: "./models/cts_optimized_0218_2125_seed42.pth"  # 使用已有模型
-  preprocess_path: "./models/preprocessing_objects_optimized.pkl"  # 使用已有预处理对象
-  device: "cuda"  # 或 "cpu"
+  model_path: "../models/cts_optimized_0218_2125_seed42.pth"  # 模型文件路径
+  preprocess_path: "../models/preprocessing_objects_optimized.pkl"  # 预处理对象路径
+  device: "cpu"  # 运行设备：cpu 或 cuda
+  embed_dim: 64  # 嵌入维度
+  num_layers: 2  # Transformer层数
+  nhead: 4       # 注意力头数
 
 # CAGS决策引擎配置
 decision_engine:
-  safety_threshold: 0.5
-  enable_uncertainty: true
-  enable_dpc: true
+  safety_threshold: 0.5    # 安全阈值
+  enable_uncertainty: true # 是否启用不确定性过滤
+  enable_dpc: true         # 是否启用动态帕累托坍缩检测
 
 # 性能阈值配置
 performance_thresholds:
-  min_throughput_mbps: 1.0
-  max_pull_time_seconds: 300
-  min_success_rate: 0.95
+  min_throughput_mbps: 1.0      # 最小吞吐量阈值
+  max_pull_time_seconds: 300    # 最大拉取时间
+  min_success_rate: 0.95        # 最小成功率

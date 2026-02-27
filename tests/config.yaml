@@ -1,0 +1,47 @@
+# CTS 系统统一配置文件
+
+# 实验基础配置
+experiment:
+  repeat_times: 3  # 重复实验次数
+  results_file: "./results/experiment_results.csv"
+
+# 测试镜像配置
+images:
+  - "alpine:latest"
+  - "nginx:alpine"
+  - "busybox:latest"
+
+# 路径配置
+paths:
+  results_file: "./data/results/experiment_results.csv"
+  logs_dir: "./logs"
+  data_dir: "./data"
+
+# 网络环境配置（用于模型输入）
+network:
+  bandwidth_mbps: 100.0
+  network_rtt: 20.0
+  packet_loss: 0.0
+
+# 系统资源配置
+system:
+  cpu_limit: 8.0
+  mem_limit_mb: 16384
+
+# 【新增】模型配置
+model:
+  model_config_path: "./configs/model_config.yaml"
+  model_path: "./models/cts_optimized.pth"
+  preprocess_path: "./models/preprocessing_objects.pkl"
+  device: "cpu" # 或 "cuda"
+
+# 代理服务器配置
+proxy:
+  host: "localhost"
+  port: 8080
+  enabled: true
+
+# 基线策略配置
+baseline:
+  strategy: "zstd_l3"
+  threads: 4
