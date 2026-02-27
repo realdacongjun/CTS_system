@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # 全局配置
 PROXY_HOST = "localhost"
-PROXY_PORT = 8000
+PROXY_PORT = 8080
 API_BASE_URL = f"http://{PROXY_HOST}:{PROXY_PORT}"
 TEMP_DIR = Path("./.cts_temp")
 TEMP_DIR.mkdir(exist_ok=True)
