@@ -65,10 +65,9 @@ def main():
     """主函数"""
     # 测试镜像列表
     test_images = [
-        "alpine:latest",
-        "nginx:alpine",
-        "busybox:latest",
-        "redis:alpine"
+        "ubuntu:latest",
+        "nginx:latest",
+        "mysql:latest"
     ]
     
     logging.basicConfig(
