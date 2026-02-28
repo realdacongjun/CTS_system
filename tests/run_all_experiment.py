@@ -214,24 +214,25 @@ def start_experiment_container(scene_name: str, scene_config: Dict, image_name: 
         logger.error(f"容器启动失败：{e}")
         return None
 
-def execute_experiment_in_container(container_name: str, experiment_name: str, scene_config: Dict, config: dict) -> bool:
+def execute_experiment_in_container(container_name: str, experiment_name: str, scene_name: str, scene_config: Dict, config: dict) -> bool:
     """执行容器内实验（适配新的实验脚本命名）"""
     logger.info(f"在容器中执行实验：{experiment_name}")
 
     # 🔧 修改：确保实验脚本路径正确（指向 experiments/ 目录）
     script_path = f"/cts/experiments/{experiment_name}.py"
     
-    # 构造命令
     exec_cmd = [
         "docker", "exec", container_name,
-        "python", script_path,
-        "--scene-name", scene_config.get("scene_name", scene_name),
+        "python", "/cts/testbed/inner_runner.py",
+        "--experiment-name", experiment_name,
+        "--scene-name", scene_name,  # 直接用参数
         "--bandwidth", scene_config["bandwidth"],
         "--delay", scene_config["delay"],
         "--cpus", str(scene_config["cpus"]),
         "--memory", scene_config["memory"],
         "--image-list", ",".join(scene_config["images"]),
-        "--repeat-times", str(scene_config["repeat_times"])
+        "--repeat-times", str(scene_config["repeat_times"]),
+        "--timeout", str(scene_config["timeout"])
     ]
 
     try:
@@ -300,16 +301,18 @@ def run_all_experiments(skip_build: bool = False) -> bool:
             continue
 
         for experiment_name in scene_config['experiments']:
+            # 🔧 修复：调用时传入 scene_name
             success = execute_experiment_in_container(
-                container_name, experiment_name, scene_config, config
+                container_name, 
+                experiment_name, 
+                scene_name,  # 新增这一行
+                scene_config, 
+                config
             )
             if not success:
                 all_scenes_succeeded = False
 
         stop_experiment_container(container_name)
-
-    collect_and_summary_results(config)
-    return all_scenes_succeeded
 
 def main():
     parser = argparse.ArgumentParser(description="CTS 实验总控")
