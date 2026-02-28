@@ -3,7 +3,7 @@ FROM ubuntu:20.04
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /cts
 
-# 🔧 优化1：合并所有 apt-get 安装，只更新一次索引
+# 合并所有 apt-get 安装，只更新一次索引
 RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     sudo \
@@ -21,11 +21,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# 创建软链接
-RUN ln -s /usr/bin/python3 /usr/bin/python && \
-    ln -s /usr/bin/pip3 /usr/bin/pip
+# 🔧 修复：使用 -sf 强制覆盖已存在的文件
+RUN ln -sf /usr/bin/python3 /usr/bin/python && \
+    ln -sf /usr/bin/pip3 /usr/bin/pip
 
-# 🔧 优化2：使用国内 PyPI 源 + 只安装 CPU 版 torch + 移除不需要的 torchvision
+# 国内专属优化：清华源 + CPU版torch
 RUN pip install --no-cache-dir --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple && \
     pip install --no-cache-dir \
     -i https://pypi.tuna.tsinghua.edu.cn/simple \
@@ -39,7 +39,7 @@ RUN pip install --no-cache-dir --upgrade pip -i https://pypi.tuna.tsinghua.edu.c
     scikit-learn \
     aiohttp
 
-# 配置 sudoers
+# tc命令免密
 RUN echo "ALL ALL=(ALL) NOPASSWD: /usr/sbin/tc" >> /etc/sudoers
 
 # 用户配置
