@@ -21,23 +21,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# 🔧 修复：使用 -sf 强制覆盖已存在的文件
+# 强制覆盖软链接，避免冲突
 RUN ln -sf /usr/bin/python3 /usr/bin/python && \
     ln -sf /usr/bin/pip3 /usr/bin/pip
 
-# 国内专属优化：清华源 + CPU版torch
-RUN pip install --no-cache-dir --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple && \
+# 🔧 核心修复：指定兼容 Python 3.8 的依赖版本
+RUN pip install --no-cache-dir --upgrade pip==22.0.4 -i https://pypi.tuna.tsinghua.edu.cn/simple && \
     pip install --no-cache-dir \
     -i https://pypi.tuna.tsinghua.edu.cn/simple \
     --extra-index-url https://download.pytorch.org/whl/cpu \
-    requests \
-    pandas \
-    numpy \
-    pyyaml \
-    torch==2.0.1 \
-    scipy \
-    scikit-learn \
-    aiohttp
+    requests==2.31.0 \
+    pandas==1.5.3 \
+    numpy==1.24.4 \
+    pyyaml==6.0.1 \
+    torch==1.13.1 \
+    scipy==1.10.1 \
+    scikit-learn==1.2.2 \
+    aiohttp==3.8.6 \
+    typing-extensions==4.5.0
 
 # tc命令免密
 RUN echo "ALL ALL=(ALL) NOPASSWD: /usr/sbin/tc" >> /etc/sudoers
