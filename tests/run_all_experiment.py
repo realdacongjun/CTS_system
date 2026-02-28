@@ -6,6 +6,7 @@ CTS闭环实验总控脚本（适配新版架构）
 1. 简化配置加载（适配 model_wrapper 的新逻辑）
 2. 统一导入路径（去掉 src. 前缀）
 3. 保留原有 Docker 编排能力
+4. 修复路径挂载、错误捕获、日志重复等关键问题
 """
 import os
 import sys
@@ -20,22 +21,31 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# ======================== 1. 路径配置 ========================
+
+# 🔧 核心修正1：合并重复的PROJECT_ROOT定义，统一路径配置
 PROJECT_ROOT = Path(__file__).parent.absolute()
+# 宿主机的预压缩镜像目录（在CTS_system根目录下的data）
+HOST_PRECOMPRESSED_DATA_DIR = PROJECT_ROOT.parent / "data"
+
+# 统一添加系统路径
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+# ======================== 1. 路径配置 ========================
 TESTBED_DIR = PROJECT_ROOT / "testbed"
 CONFIG_DIR = PROJECT_ROOT / "configs"
 RESULTS_DIR = PROJECT_ROOT / "results"
 LOGS_DIR = PROJECT_ROOT / "logs"
 EXPERIMENTS_DIR = PROJECT_ROOT / "experiments"
-DATA_DIR = PROJECT_ROOT / "data"
+# 容器内的data目录（同时映射宿主机tests/data和根目录data）
+CONTAINER_DATA_DIR = PROJECT_ROOT / "data"
 
-for dir_path in [RESULTS_DIR, LOGS_DIR]:
+# 创建必要目录
+for dir_path in [RESULTS_DIR, LOGS_DIR, CONTAINER_DATA_DIR]:
     dir_path.mkdir(exist_ok=True, parents=True)
 
 # ======================== 2. 日志配置 ========================
+# 🔧 核心修正2：合并重复的日志配置，避免覆盖
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -65,7 +75,7 @@ def load_config() -> dict:
     return {
         "paths": {
             "results_file": str(RESULTS_DIR / "experiment_results.csv"),
-            "image_features_csv": str(DATA_DIR / "image_features_database.csv")
+            "image_features_csv": str(CONTAINER_DATA_DIR / "image_features_database.csv")
         },
         "experiment": {
             "repeat_times": 1,
@@ -139,8 +149,8 @@ def get_image_features_from_csv(image_name: str, config: dict) -> dict:
             match = df[df['image_name'].str.contains(image_name.split(':')[0], na=False, case=False)]
             if not match.empty:
                 return match.iloc[0].to_dict()
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"读取镜像特征失败：{e}")
     return {'total_size_mb': 200.0}
 
 # ======================== 4. 测试矩阵 ========================
@@ -182,6 +192,7 @@ def build_testbed_image(image_name: str = "cts-testbed:latest") -> bool:
         return True
     except Exception as e:
         logger.error(f"测试床镜像构建失败：{e}")
+        logger.error(f"构建错误详情：{e.stderr if hasattr(e, 'stderr') else '无'}")
         return False
 
 def start_experiment_container(scene_name: str, scene_config: Dict, image_name: str = "cts-testbed:latest") -> Optional[str]:
@@ -189,43 +200,46 @@ def start_experiment_container(scene_name: str, scene_config: Dict, image_name: 
     container_name = f"cts-run-{scene_name}"
     logger.info(f"启动实验容器：{container_name}")
 
+    # 先清理旧容器
     try:
         subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-    except:
-        pass
-
-
+    except Exception as e:
+        logger.warning(f"清理旧容器失败：{e}")
 
     try:
         run_cmd = [
             "docker", "run", "-d", "--name", container_name,
             f"--cpus={scene_config['cpus']}", f"--memory={scene_config['memory']}",
             "--network=host", "--privileged",
-            # 🔧 修复：挂载整个项目根目录，而不是只挂 tests
-            "-v", f"{PROJECT_ROOT}:/cts",  # 原来是 /root/CTS_system/tests:/cts
-            "-v", "/var/run/docker.sock:/var/run/docker.sock",
+            # 🔧 核心修正3：正确挂载所有必要目录
+            "-v", f"{PROJECT_ROOT}:/cts",  # 挂载tests目录到容器/cts
+            "-v", f"{HOST_PRECOMPRESSED_DATA_DIR}:/cts/data/preprocessed_images",  # 挂载预压缩镜像目录
+            "-v", "/var/run/docker.sock:/var/run/docker.sock",  # 挂载docker sock
             image_name, "sleep", "infinity"
         ]
         result = subprocess.run(run_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, encoding="utf-8")
         logger.info(f"容器启动成功")
-        time.sleep(2)
+        time.sleep(2)  # 等待容器完全启动
         return container_name
     except Exception as e:
         logger.error(f"容器启动失败：{e}")
+        logger.error(f"启动错误详情：{e.stderr if hasattr(e, 'stderr') else '无'}")
         return None
 
 def execute_experiment_in_container(container_name: str, experiment_name: str, scene_name: str, scene_config: Dict, config: dict) -> bool:
-    """执行容器内实验（适配新的实验脚本命名）"""
+    """执行容器内实验（适配新的实验脚本命名，增强错误捕获）"""
     logger.info(f"在容器中执行实验：{experiment_name}")
 
-    # 🔧 修改：确保实验脚本路径正确（指向 experiments/ 目录）
-    script_path = f"/cts/experiments/{experiment_name}.py"
-    
+    # 🔧 核心修正4：统一exp4文件名拼写（适配实际文件）
+    if experiment_name == "exp4_efficiency":
+        experiment_name = "exp4_effeciency"  # 匹配实际文件名（多一个f）
+
+    # 🔧 核心修正5：增强错误捕获，打印详细执行日志
     exec_cmd = [
         "docker", "exec", container_name,
         "python", "/cts/testbed/inner_runner.py",
         "--experiment-name", experiment_name,
-        "--scene-name", scene_name,  # 直接用参数
+        "--scene-name", scene_name,
         "--bandwidth", scene_config["bandwidth"],
         "--delay", scene_config["delay"],
         "--cpus", str(scene_config["cpus"]),
@@ -240,10 +254,17 @@ def execute_experiment_in_container(container_name: str, experiment_name: str, s
             exec_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, encoding="utf-8",
             timeout=scene_config["timeout"]
         )
-        logger.info(f"实验执行成功")
+        logger.info(f"实验执行成功，输出摘要：{result.stdout[:200]}")
         return True
-    except Exception as e:
+    except subprocess.CalledProcessError as e:
+        # 打印详细错误信息，方便调试
         logger.error(f"实验执行失败：{e}")
+        logger.error(f"执行命令：{' '.join(exec_cmd)}")
+        logger.error(f"标准输出：{e.stdout}")
+        logger.error(f"错误输出：{e.stderr}")
+        return False
+    except Exception as e:
+        logger.error(f"实验执行异常：{e}", exc_info=True)
         return False
 
 def stop_experiment_container(container_name: str) -> bool:
@@ -253,7 +274,8 @@ def stop_experiment_container(container_name: str) -> bool:
         subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         time.sleep(3)
         return True
-    except:
+    except Exception as e:
+        logger.warning(f"停止容器失败：{e}")
         return False
 
 # ======================== 6. 结果汇总 ========================
@@ -267,18 +289,22 @@ def collect_and_summary_results(config: dict) -> None:
         try:
             df = pd.read_csv(result_file, encoding='utf-8-sig')
             all_results.append(df)
+            logger.info(f"读取结果文件：{result_file}，共{len(df)}条记录")
         except Exception as e:
-            logger.warning(f"读取结果文件失败：{e}")
+            logger.warning(f"读取结果文件失败：{result_file} - {e}")
 
     if all_results:
         merged_df = pd.concat(all_results, ignore_index=True)
         merged_df.to_csv(results_file, index=False, encoding='utf-8-sig')
-        logger.info(f"结果已保存到：{results_file}")
+        logger.info(f"✅ 所有结果已汇总保存到：{results_file}，共{len(merged_df)}条记录")
+    else:
+        logger.warning("⚠️ 未找到任何实验结果文件")
 
 # ======================== 7. 主流程 ========================
-def run_all_experiments(skip_build: bool = False) -> bool:
+def run_all_experiments(skip_build: bool = False, config: dict = None) -> bool:
     """主实验流程"""
-    config = load_config()
+    if config is None:
+        config = load_config()
     logger.info(f"📌 实验配置：重复次数={config['experiment']['repeat_times']}")
 
     if not skip_build:
@@ -297,22 +323,31 @@ def run_all_experiments(skip_build: bool = False) -> bool:
         
         container_name = start_experiment_container(scene_name, scene_config)
         if not container_name:
+            logger.error(f"❌ 场景{scene_name}容器启动失败，跳过该场景")
             all_scenes_succeeded = False
             continue
 
+        # 执行该场景下的所有实验
         for experiment_name in scene_config['experiments']:
-            # 🔧 修复：调用时传入 scene_name
             success = execute_experiment_in_container(
                 container_name, 
                 experiment_name, 
-                scene_name,  # 新增这一行
+                scene_name,
                 scene_config, 
                 config
             )
             if not success:
+                logger.error(f"❌ 实验{experiment_name}执行失败")
                 all_scenes_succeeded = False
+            else:
+                logger.info(f"✅ 实验{experiment_name}执行成功")
 
+        # 停止容器
         stop_experiment_container(container_name)
+
+    # 🔧 核心修正6：补充结果汇总
+    collect_and_summary_results(config)
+    return all_scenes_succeeded
 
 def main():
     parser = argparse.ArgumentParser(description="CTS 实验总控")
@@ -321,13 +356,19 @@ def main():
     parser.add_argument("--images", type=str, default=None, help="覆盖配置中的镜像列表")
     args = parser.parse_args()
 
+    # 加载并更新配置
     config = load_config()
     if args.repeat_times:
         config['experiment']['repeat_times'] = args.repeat_times
+        logger.info(f"覆盖重复次数为：{args.repeat_times}")
     if args.images:
         config['experiment']['images'] = args.images.split(',')
+        logger.info(f"覆盖镜像列表为：{config['experiment']['images']}")
 
-    success = run_all_experiments(skip_build=args.skip_build)
+    # 执行所有实验
+    success = run_all_experiments(skip_build=args.skip_build, config=config)
+    
+    # 退出码：0成功，1失败
     sys.exit(0 if success else 1)
 
 if __name__ == "__main__":
