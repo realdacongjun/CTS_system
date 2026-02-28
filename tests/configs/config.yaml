@@ -1,0 +1,65 @@
+# configs/config.yaml
+experiment:
+  repeat_times: 3
+  timeout: 3600
+  images:
+    - "ubuntu:latest"
+    - "nginx:latest"
+    - "mysql:latest"
+
+paths:
+  results_file: "./results/experiment_results.csv"
+  logs_dir: "./logs"
+  data_dir: "./data"
+  image_features_csv: "./data/image_features_database.csv"
+
+network:
+  bandwidth_mbps: 100.0
+  network_rtt: 20.0
+  packet_loss: 0.0
+
+system:
+  cpu_limit: 6.0
+  mem_limit_mb: 12288
+
+model:
+  model_config_path: "./configs/model_config.yaml"
+  model_path: "./models/cts_optimized.pth"
+  preprocess_path: "./models/preprocessing_objects_optimized.pkl"
+  device: "cpu"
+
+proxy:
+  host: "localhost"
+  port: 8080
+  enabled: true
+
+baseline:
+  strategy: "gzip"
+  threads: 1
+  compression_level: 6
+
+scenes:
+  S1_Normal:
+    bandwidth: "100mbit"
+    delay: "10ms"
+    cpus: 6.0
+    memory: "12g"
+    experiments: ["exp1_baseline_comparison", "exp2_ablation", "exp3_generalization", "exp4_efficiency", "exp5_robustness"]
+    timeout: 3600
+
+  S2_WeakNet:
+    bandwidth: "5mbit"
+    delay: "100ms"
+    cpus: 2.0
+    memory: "8g"
+    experiments: ["exp1_baseline_comparison", "exp2_ablation", "exp3_generalization", "exp4_efficiency", "exp5_robustness"]
+    timeout: 7200
+
+  S3_Robust:
+    bandwidth: "1mbit"
+    delay: "500ms"
+    packet_loss: 10.0
+    cpus: 1.0
+    memory: "4g"
+    experiments: ["exp5_robustness"]
+    timeout: 10800

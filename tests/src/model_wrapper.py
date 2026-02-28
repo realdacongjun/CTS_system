@@ -1,3 +1,4 @@
+# src/model_wrapper.py
 import torch
 import pickle
 import numpy as np
@@ -6,66 +7,41 @@ import logging
 import time
 import yaml
 from typing import Dict, Any, Tuple, List, Optional
-from pathlib import Path
-
-# 添加上级目录到路径
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class CFTNetWrapper:
     def __init__(self, model_config_path: str):
-        """
-        初始化CFT-Net模型包装器 (兼容 CompactCFTNetV2)
-        
-        Args:
-            model_config_path: 模型配置文件路径
-        """
-        # 1. 加载配置
-        # 【修复】确保路径是相对于项目根目录，或者转为绝对路径
-        config_path = Path(model_config_path)
-        if not config_path.is_absolute():
-            # 如果传入的是相对路径，假设是相对于项目根目录
-            # 或者相对于当前文件所在目录
-            # 这里我们假设是相对于项目根目录
-            pass
-            
-        with open(config_path, 'r', encoding='utf-8') as f:
+        with open(model_config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
         
-        # 【修复】处理模型文件路径
-        # 如果配置里是相对路径，把它变成相对于 config 文件所在的目录
-        base_dir = config_path.parent
+        # 🔧 修复1：直接读取顶层key，而非 config['model']['xxx']
+        self.model_path = self.config['model_path']
+        self.preprocess_path = self.config['preprocessing_path']
         
-        model_path_raw = self.config['model']['model_path']
-        preprocess_path_raw = self.config['model']['preprocess_path']
-        
-        self.model_path = str((base_dir / model_path_raw).resolve())
-        self.preprocess_path = str((base_dir / preprocess_path_raw).resolve())
-        
-        # 2. 设备自动选择 (优化点1: 自动回退CPU)
-        requested_device = self.config['model'].get('device', 'cpu')
+        # 处理相对路径：相对于 model_config.yaml 所在目录解析
+        config_dir = os.path.dirname(model_config_path)
+        if not os.path.isabs(self.model_path):
+            self.model_path = os.path.join(config_dir, self.model_path)
+        if not os.path.isabs(self.preprocess_path):
+            self.preprocess_path = os.path.join(config_dir, self.preprocess_path)
+
+        # 设备选择
+        requested_device = self.config.get('device', 'cpu')
         if requested_device == 'cuda' and not torch.cuda.is_available():
             self.device = torch.device('cpu')
             logging.warning(f"⚠️  CUDA不可用，自动回退到CPU")
         else:
             self.device = torch.device(requested_device)
         
-        # 3. 设置日志
         self.logger = logging.getLogger(__name__)
-        
-        # 4. 加载模型和预处理器
         self._start_time = time.time()
         self._load_everything()
         self._load_time = time.time() - self._start_time
         self.logger.info(f"✅ 系统加载完成，耗时: {self._load_time:.2f}s")
 
     def _load_everything(self):
-        """【优化点2】统一加载：预处理器 -> 模型类 -> 模型权重"""
         try:
-            # -----------------------------------------------------------
-            # 1. 加载预处理器 (优先加载，用于获取维度)
-            # -----------------------------------------------------------
             self.logger.info(f"   正在加载预处理器: {self.preprocess_path}")
             with open(self.preprocess_path, 'rb') as f:
                 preprocess = pickle.load(f)
@@ -73,52 +49,21 @@ class CFTNetWrapper:
             self.scaler_c = preprocess['scaler_c']
             self.scaler_i = preprocess['scaler_i']
             self.enc = preprocess['enc']
-            self.cols_c = preprocess['cols_c']  # 客户端特征列表
-            self.cols_i = preprocess['cols_i']  # 镜像特征列表
+            self.cols_c = preprocess['cols_c']
+            self.cols_i = preprocess['cols_i']
             self.num_algos = len(self.enc.classes_)
             self.algo_list = self.enc.classes_.tolist()
             
-            # -----------------------------------------------------------
-            # 2. 动态导入模型类
-            # -----------------------------------------------------------
             self.logger.info(f"   正在导入模型类...")
             try:
-                # 方案B：更稳健的绝对导入 (推荐)
-                import importlib.util
-                from pathlib import Path
-                # 假设 cts_model.py 和当前文件在同一个目录
-                cts_model_path = Path(__file__).parent / "cts_model.py"
-                
-                spec = importlib.util.spec_from_file_location("cts_model", cts_model_path)
-                cts_module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(cts_module)
-                
-                CompactCFTNetV2 = cts_module.CompactCFTNetV2
+                from cts_model import CompactCFTNetV2
                 self.model_class = CompactCFTNetV2
-                
-            except Exception as e:
-                raise ImportError(
-                    f"❌ 无法导入 CompactCFTNetV2。\n"
-                    f"   错误: {e}\n"
-                    f"   请确保 cts_model.py 在 src/ 目录下。"
-                )
+            except ImportError:
+                raise ImportError("❌ 无法导入 CompactCFTNetV2")
             
-            # -----------------------------------------------------------
-            # 3. 初始化模型 (从配置或预处理器推断参数)
-            # -----------------------------------------------------------
-            # 【优化点3】从 config 读取 embed_dim，默认64
-            embed_dim = self.config['model'].get('embed_dim', 64)
-            num_layers = self.config['model'].get('num_layers', 2)
-            nhead = self.config['model'].get('nhead', 4)
+            embed_dim = self.config.get('embed_dim', 64)
             
             self.logger.info(f"   正在初始化模型...")
-            self.logger.info(f"     - 客户端特征维度: {len(self.cols_c)}")
-            self.logger.info(f"     - 镜像特征维度: {len(self.cols_i)}")
-            self.logger.info(f"     - 算法数: {self.num_algos}")
-            self.logger.info(f"     - Embed dim: {embed_dim}")
-            self.logger.info(f"     - Transformer layers: {num_layers}")
-            self.logger.info(f"     - Device: {self.device}")
-            
             self.model = self.model_class(
                 client_feats=len(self.cols_c),
                 image_feats=len(self.cols_i),
@@ -126,31 +71,25 @@ class CFTNetWrapper:
                 embed_dim=embed_dim
             ).to(self.device)
             
-            # -----------------------------------------------------------
-            # 4. 加载权重 (兼容多种格式)
-            # -----------------------------------------------------------
             self.logger.info(f"   正在加载模型权重: {self.model_path}")
             checkpoint = torch.load(self.model_path, map_location=self.device)
-            
             if isinstance(checkpoint, dict):
                 if 'model_state_dict' in checkpoint:
-                    # 格式1: 完整checkpoint字典
                     self.model.load_state_dict(checkpoint['model_state_dict'])
                 else:
-                    # 格式2: 仅state_dict字典
                     self.model.load_state_dict(checkpoint)
             else:
-                # 格式3: 直接是state_dict对象
                 self.model.load_state_dict(checkpoint)
             
             self.model.eval()
             self.logger.info(f"✅ CompactCFTNetV2 模型加载成功")
             
         except Exception as e:
-            self.logger.error(f"❌ 系统加载失败: {e}")
-            import traceback
-            traceback.print_exc()
+            self.logger.error(f"❌ 系统加载失败: {e}", exc_info=True)
             raise
+
+    # ... (其余函数: get_model_info, _construct_features, predict_single_config 等保持不变，只需确保上面的初始化部分正确) ...
+    # 为了节省篇幅，这里假设后面的函数保持原样，只需复制你原来代码中 _construct_features 及之后的内容即可
 
     # ==========================================
     # 【新增】模型信息查询接口 (用于实验四)

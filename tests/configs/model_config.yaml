@@ -1,20 +1,92 @@
-# CFT-Net模型配置
-model:
-  model_path: "../models/cts_optimized_0218_2125_seed42.pth"  # 模型文件路径
-  preprocess_path: "../models/preprocessing_objects_optimized.pkl"  # 预处理对象路径
-  device: "cpu"  # 运行设备：cpu 或 cuda
-  embed_dim: 64  # 嵌入维度
-  num_layers: 2  # Transformer层数
-  nhead: 4       # 注意力头数
+# CTS 模型配置文件（10种压缩策略版，匹配CompactCFTNetV2）
+# 路径说明：位于 configs/ 目录，模型路径相对该目录为 ../models/
 
-# CAGS决策引擎配置
-decision_engine:
-  safety_threshold: 0.5    # 安全阈值
-  enable_uncertainty: true # 是否启用不确定性过滤
-  enable_dpc: true         # 是否启用动态帕累托坍缩检测
+# ======================== 1. 模型文件路径（严格对齐代码） ========================
+model_path: "../models/cts_optimized.pth"
+# 把 preprocess_path 改为 preprocessing_path
+preprocessing_path: "../models/preprocessing_objects_optimized.pkl"
 
-# 性能阈值配置
-performance_thresholds:
-  min_throughput_mbps: 1.0      # 最小吞吐量阈值
-  max_pull_time_seconds: 300    # 最大拉取时间
-  min_success_rate: 0.95        # 最小成功率
+# ======================== 2. 模型结构参数（匹配代码CONFIG） ========================
+embed_dim: 64
+nhead: 4
+num_layers: 2
+dim_feedforward: 128
+dropout: 0.2
+activation: "gelu"
+use_batch_norm: false
+
+# ======================== 3. 特征列配置（和load_data()完全一致） ========================
+cols_c:
+  - "bandwidth_mbps"
+  - "cpu_limit"
+  - "network_rtt"
+  - "mem_limit_mb"
+  - "theoretical_time"
+  - "cpu_to_size_ratio"
+  - "mem_to_size_ratio"
+  - "network_score"
+
+cols_i:
+  - "total_size_mb"
+  - "avg_layer_entropy"
+  - "entropy_std"
+  - "layer_count"
+  - "size_std_mb"
+  - "text_ratio"
+  - "zero_ratio"
+
+# ======================== 4. 推理配置（适配CPU环境） ========================
+device: "cpu"
+infer_batch_size: 1
+infer_timeout: 10
+enable_uncertainty: true
+
+# ======================== 5. EDL/不确定性参数（对齐代码CONFIG） ========================
+alpha_init: 2.0
+beta_init: 1.0
+v_init: 1.0
+reg_coeff: 0.1
+warmup_epochs: 0
+picp_target: 0.9
+
+# ======================== 6. 决策引擎参数（扩展到10种压缩策略） ========================
+# 10种策略：覆盖主流算法+多级压缩，匹配实验对比需求
+candidate_strategies:
+  # 基础算法（2种）
+  - "gzip"           # Docker原生基线（默认）
+  - "lz4"            # 极速解压，适合低延迟场景
+  
+  # ZSTD多级压缩（5种，覆盖轻量到高压缩）
+  - "zstd_l1"        # 最快压缩，接近lz4速度
+  - "zstd_l3"        # 平衡速度与压缩比（默认）
+  - "zstd_l5"        # 高压缩比，适合带宽受限场景
+  - "zstd_l9"        # 超高压缩比，适合大镜像
+  - "zstd_l12"       # 极限压缩比，适合冷镜像分发
+  
+  # 补充算法（3种，覆盖不同场景）
+  - "brotli_l4"      # Web优化算法，中等压缩
+  - "gzip_fast"      # gzip快速模式（-1级），比默认快30%
+  - "lz4_high"       # lz4高压缩模式（-9级），比默认压缩比高20%
+
+# 线程数候选范围（适配8核CPU，留2核给系统）
+threads_range: [1, 2, 4, 6]
+
+# 决策引擎核心参数
+default_strategy: "gzip"       # 降级策略（模型失败时用Docker原生）
+default_threads: 1             # 降级策略线程数
+safety_threshold: 0.7          # 鲁棒性阈值
+enable_dynamic_threads: true   # 动态线程调整
+
+# ======================== 7. EDL/不确定性参数（完整对齐） ========================
+reg_coeff: 0.1
+warmup_epochs: 0
+picp_target: 0.9
+alpha_init: 2.0
+beta_init: 1.0
+v_init: 1.0
+
+# ======================== 8. 日志/调试配置 ========================
+verbose_infer: false
+save_infer_log: true
+infer_log_path: "./logs/model_infer.log"
+save_scaler_log: false
