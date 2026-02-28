@@ -194,12 +194,15 @@ def start_experiment_container(scene_name: str, scene_config: Dict, image_name: 
     except:
         pass
 
+
+
     try:
         run_cmd = [
             "docker", "run", "-d", "--name", container_name,
             f"--cpus={scene_config['cpus']}", f"--memory={scene_config['memory']}",
             "--network=host", "--privileged",
-            "-v", f"{PROJECT_ROOT}:/cts",
+            # 🔧 修复：挂载整个项目根目录，而不是只挂 tests
+            "-v", f"{PROJECT_ROOT}:/cts",  # 原来是 /root/CTS_system/tests:/cts
             "-v", "/var/run/docker.sock:/var/run/docker.sock",
             image_name, "sleep", "infinity"
         ]
