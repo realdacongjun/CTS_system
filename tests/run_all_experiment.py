@@ -236,7 +236,8 @@ def execute_experiment_in_container(container_name: str, experiment_name: str, s
 
     # 🔧 核心修正5：增强错误捕获，打印详细执行日志
     exec_cmd = [
-        "docker", "exec", container_name,
+        "docker", "exec", "--user", "root",  # 🔧 核心添加：用root权限执行
+        container_name,
         "python", "/cts/testbed/inner_runner.py",
         "--experiment-name", experiment_name,
         "--scene-name", scene_name,
@@ -248,6 +249,9 @@ def execute_experiment_in_container(container_name: str, experiment_name: str, s
         "--repeat-times", str(scene_config["repeat_times"]),
         "--timeout", str(scene_config["timeout"])
     ]
+
+
+
 
     try:
         result = subprocess.run(
