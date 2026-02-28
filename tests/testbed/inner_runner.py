@@ -279,8 +279,10 @@ def main():
     result_path = CTS_ROOT / "results" / f"{args.scene_name}_inner_results.yaml"
     result_path.parent.mkdir(exist_ok=True, mode=0o755)
     with open(result_path, "w", encoding="utf-8") as f:
-        yaml.dump(all_results, f, ensure_ascii=False, indent=2)
-    
+        yaml.dump(all_results, f, indent=2)
+
+
+
     logger.info(f"所有实验执行完成，结果保存至: {result_path}")
     
     # 检查失败实验
