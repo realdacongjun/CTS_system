@@ -113,15 +113,6 @@ def get_image_features_from_csv(image_name: str) -> dict:
         logger.error(f"获取镜像特征失败: {e}")
         return {'total_size_mb': 100.0}
 
-# experiments/exp1_baseline_comparison.py
-# ... (前面的import保持不变) ...
-
-# 🔧 修复2：修正导入路径，从 testbed 导入，而非 tests
-from testbed import adaptive_downloader, baseline_downloader
-from model_wrapper import CFTNetWrapper
-from cags_decision import CAGSDecisionEngine
-
-# ... (LOG_DIR, RESULT_DIR, logger配置保持不变) ...
 
 def cts_strategy_selector(image: str, env_state: dict, wrapper, engine) -> Tuple[str, int]:
     """CTS策略选择（核心逻辑保留，移除强制覆盖）"""
