@@ -14,9 +14,13 @@ from pathlib import Path
 from typing import Dict, Tuple, Optional
 import json
 
-# ======================== 关键修改1：统一导入路径 ========================
-# 🔧 修复：从 testbed 导入，且不再需要单独的 baseline_downloader
-from testbed import adaptive_downloader
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# 直接导入 tests 目录下的 adaptive_downloader
+import adaptive_downloader
+
+
 
 # 容器内固定路径
 LOG_DIR = Path("/cts/logs")

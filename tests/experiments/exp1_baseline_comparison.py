@@ -15,7 +15,11 @@ from pathlib import Path
 from typing import Dict, Tuple, Optional
 import json
 
-from tests import adaptive_downloader, baseline_downloader  # 替换yaml保存JSON，更通用
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import adaptive_downloader
+import baseline_downloader
 from model_wrapper import CFTNetWrapper
 from cags_decision import CAGSDecisionEngine  # 修复：是cags_decision不是decision_engine
 # ======================== 关键修改1：适配容器内路径 ========================
