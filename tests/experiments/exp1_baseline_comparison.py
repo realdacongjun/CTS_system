@@ -15,13 +15,16 @@ from pathlib import Path
 from typing import Dict, Tuple, Optional
 import json
 
-
+# 把 tests 目录（/cts）加到 Python 路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
+# 🔧 新增：把 src 目录也加到 Python 路径，这样就能找到 model_wrapper 和 cags_decision
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+# 现在可以正常导入了
 import adaptive_downloader
 import baseline_downloader
 from model_wrapper import CFTNetWrapper
-from cags_decision import CAGSDecisionEngine  # 修复：是cags_decision不是decision_engine
+from cags_decision import CAGSDecisionEngine # 修复：是cags_decision不是decision_engine
 # ======================== 关键修改1：适配容器内路径 ========================
 # 容器内固定路径（无需计算PROJECT_ROOT）
 LOG_DIR = Path("/cts/logs")
