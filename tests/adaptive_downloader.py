@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CTS 自适应下载器 - 物理真实版
+CTS 自适应下载器 - 物理真实版（修复版）
 核心逻辑：
 1. 调用 CAGS 引擎决策
 2. 实际执行 docker save -> 压缩 -> 解压 -> docker load
@@ -149,13 +149,21 @@ def _run_cts_pipeline(
         # 1. Docker Save (获取原始镜像数据流)
         logger.info(f"[CTS] Step 1/4: docker save {image_name}...")
         t_save = time.perf_counter()
-        with open(tar_path, 'wb') as f:
-            subprocess.run(
-                ["docker", "save", image_name],
-                stdout=f, check=True, timeout=600
-            )
-        save_time = time.perf_counter() - t_save
-        logger.info(f"[CTS] Save done: {save_time:.2f}s")
+        try:
+            with open(tar_path, 'wb') as f:
+                result = subprocess.run(
+                    ["docker", "save", image_name],
+                    stdout=f, stderr=subprocess.PIPE, check=True, timeout=600
+                )
+            save_time = time.perf_counter() - t_save
+            logger.info(f"[CTS] Save done: {save_time:.2f}s")
+        except subprocess.CalledProcessError as e:
+            # 🔧 新增：打印docker save的具体错误
+            logger.error(f"❌ docker save 失败: {e.stderr.decode()[:200]}")
+            raise  # 继续抛出异常，让外层处理
+        except Exception as e:
+            logger.error(f"❌ docker save 异常: {str(e)[:200]}")
+            raise
 
         # 2. 压缩 (应用决策)
         logger.info(f"[CTS] Step 2/4: Compressing with {algo_name} @ {threads} threads...")
@@ -207,19 +215,34 @@ def _run_cts_pipeline(
         total_time = time.perf_counter() - total_start
         success = True
         
-        # 清理临时文件
+        # 清理临时文件（无论成功失败都清理）
+        try:
+            tar_path.unlink(missing_ok=True)
+            comp_path.unlink(missing_ok=True)
+            recovered_tar.unlink(missing_ok=True)
+            logger.info(f"[CTS] 临时文件已清理")
+        except Exception as e:
+            logger.warning(f"⚠️  临时文件清理失败: {e}")
+
+        return success, total_time, ""
+
+    except subprocess.TimeoutExpired:
+        # 🔧 新增：超时也清理临时文件
         try:
             tar_path.unlink(missing_ok=True)
             comp_path.unlink(missing_ok=True)
             recovered_tar.unlink(missing_ok=True)
         except:
             pass
-
-        return success, total_time, ""
-
-    except subprocess.TimeoutExpired:
         return False, 0.0, "Timeout"
     except Exception as e:
+        # 🔧 新增：异常也清理临时文件
+        try:
+            tar_path.unlink(missing_ok=True)
+            comp_path.unlink(missing_ok=True)
+            recovered_tar.unlink(missing_ok=True)
+        except:
+            pass
         return False, 0.0, str(e)[:200]
 
 def cts_download(
@@ -228,12 +251,12 @@ def cts_download(
     threads: Optional[int] = None,
     env_state: Optional[Dict] = None,
     image_features: Optional[Dict] = None,
-    clear_cache: bool = True
+    clear_cache: bool = False  # 🔧 核心修改：默认不清理缓存！避免删掉刚拉取的镜像
 ) -> Dict[str, Any]:
     
     start_total = time.perf_counter()
     
-    # 0. 清理缓存
+    # 0. 清理缓存（默认关闭）
     if clear_cache:
         try:
             subprocess.run(["docker", "rmi", "-f", image_name], 
@@ -293,17 +316,45 @@ def cts_download(
         logger.info(f"[Baseline] 执行原生 docker pull...")
         t0 = time.time()
         try:
-            subprocess.run(["docker", "pull", image_name], check=True, timeout=600)
-            total_time = time.time() - t0
-            return {
-                "strategy": "Baseline",
-                "compression": "gzip",
-                "threads": 1,
-                "image": image_name,
-                "time_s": round(total_time, 2),
-                "success": True,
-                "error": None
-            }
+            # 🔧 新增：捕获完整输出，避免NoneType
+            result = subprocess.run(
+                ["docker", "pull", image_name],
+                capture_output=True, text=True, timeout=600
+            )
+            # 🔧 新增：判断result是否为None
+            if result is None:
+                return {
+                    "strategy": "Baseline",
+                    "compression": "gzip",
+                    "threads": 1,
+                    "image": image_name,
+                    "time_s": 0,
+                    "success": False,
+                    "error": "Docker Pull返回空结果"
+                }
+            # 🔧 新增：判断返回码
+            if result.returncode == 0:
+                total_time = time.time() - t0
+                return {
+                    "strategy": "Baseline",
+                    "compression": "gzip",
+                    "threads": 1,
+                    "image": image_name,
+                    "time_s": round(total_time, 2),
+                    "success": True,
+                    "error": None
+                }
+            else:
+                total_time = time.time() - t0
+                return {
+                    "strategy": "Baseline",
+                    "compression": "gzip",
+                    "threads": 1,
+                    "image": image_name,
+                    "time_s": 0,
+                    "success": False,
+                    "error": f"Docker Pull失败: {result.stderr[:200] if result.stderr else '未知错误'}"
+                }
         except Exception as e:
             return {
                 "strategy": "Baseline",
