@@ -174,7 +174,7 @@ def run_experiment_script(experiment_name: str, scene_cfg: Dict[str, Any]) -> Di
     
     # 🔧 修复：移除 --packet-loss, --jitter, --model-config-path
     cmd = [
-        "python", str(script_path),
+        "sudo","python", str(script_path),
         "--scene-name", scene_cfg["scene_name"],
         "--bandwidth", scene_cfg["bandwidth"],
         "--delay", scene_cfg["delay"],
