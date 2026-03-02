@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 def pull_with_docker(
     image_name: str, 
-    clear_cache: bool = True, 
+    clear_cache: bool = False, 
     timeout: int = 300
 ) -> Dict[str, Any]:
     """
@@ -137,3 +137,5 @@ if __name__ == "__main__":
     print("\n[Baseline 测试结果]")
     for k, v in result.items():
         print(f"{k}: {v}")
+
+
