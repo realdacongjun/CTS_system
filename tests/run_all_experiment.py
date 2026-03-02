@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Tuple
 # 🔧 核心修正1：合并重复的PROJECT_ROOT定义，统一路径配置
 PROJECT_ROOT = Path(__file__).parent.absolute()
 # 宿主机的预压缩镜像目录（在CTS_system根目录下的data）
-HOST_PRECOMPRESSED_DATA_DIR = PROJECT_ROOT.parent / "data"
+HOST_PRECOMPRESSED_DATA_DIR = PROJECT_ROOT.parent / "data" / "preprocessed_images"
 
 # 统一添加系统路径
 sys.path.insert(0, str(PROJECT_ROOT))

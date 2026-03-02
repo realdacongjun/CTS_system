@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CTS 自适应下载器 - 物理真实版（修复版）
-核心逻辑：
+CTS 自适应下载器 - 预压缩优化版
+核心逻辑（优化后）：
 1. 调用 CAGS 引擎决策
-2. 实际执行 docker save -> 压缩 -> 解压 -> docker load
-3. 记录真实耗时
+2. 直接读取预压缩文件（跳过 docker save 和实时压缩）
+3. 执行解压 -> docker load
+4. 记录真实耗时
 """
 import os
 import sys
@@ -20,6 +21,8 @@ from typing import Dict, Any, Optional, Tuple
 # 路径配置
 CTS_ROOT = Path(__file__).parent.parent
 SRC_DIR = CTS_ROOT / "src"
+PRECOMPRESSED_DIR = CTS_ROOT / "data" / "preprocessed_images"  # 预压缩文件目录
+
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
@@ -27,6 +30,29 @@ logger = logging.getLogger(__name__)
 
 # 全局缓存
 _ENGINE_CACHE: Optional[Tuple] = None
+
+# ==========================================
+# 🔧 核心映射：模型决策 algo_name -> 预压缩文件后缀
+# ==========================================
+ALGO_TO_PRECOMPRESSED_SUFFIX = {
+    # Gzip 系列
+    "gzip": "gzip-6",
+    "gzip_fast": "gzip-1",
+    
+    # LZ4 系列
+    "lz4": "lz4-fast",
+    "lz4_high": "lz4-slow",
+    
+    # ZSTD 系列
+    "zstd_l1": "zstd-1",
+    "zstd_l3": "zstd-3",
+    "zstd_l5": "zstd-6",
+    "zstd_l9": "zstd-6",
+    "zstd_l12": "zstd-6",
+    
+    # Brotli 系列
+    "brotli_l4": "brotli-1"
+}
 
 def _get_cts_engine():
     global _ENGINE_CACHE
@@ -75,7 +101,7 @@ def _collect_env_state() -> Dict:
         cpu_count = psutil.cpu_count(logical=True)
         mem_total = psutil.virtual_memory().total / 1024 / 1024
         return {
-            'bandwidth_mbps': 100.0,  # 可由外部传入覆盖
+            'bandwidth_mbps': 100.0,
             'network_rtt': 10.0,
             'cpu_limit': float(cpu_count),
             'mem_limit_mb': float(mem_total)
@@ -83,50 +109,32 @@ def _collect_env_state() -> Dict:
     except:
         return {'bandwidth_mbps': 100.0, 'cpu_limit': 4.0, 'mem_limit_mb': 8192.0}
 
-def _build_compress_command(algo_name: str, threads: int, input_path: str, output_path: str) -> list:
-    """
-    核心映射：将模型决策的 algo_name 映射为实际的 Shell 命令
-    要求容器内已安装：gzip, lz4, zstd, brotli
-    """
-    # 通用格式：command [args] > output
-    # 注意：为了性能对比，我们使用管道流，避免双重IO
-    
-    algo_map = {
-        # Gzip 系列
-        "gzip": ["pigz", "-p", str(max(1, threads)), "-c"],  # pigz 是并行 gzip
-        "gzip_fast": ["pigz", "-p", str(max(1, threads)), "-1", "-c"],
-        
-        # LZ4 系列 (极快)
-        "lz4": ["lz4", "-c", "-z"],
-        "lz4_high": ["lz4", "-c", "-z", "-9"],
-        
-        # ZSTD 系列 (平衡)
-        "zstd_l1": ["zstd", "-T", str(max(1, threads)), "-1", "-c"],
-        "zstd_l3": ["zstd", "-T", str(max(1, threads)), "-3", "-c"],
-        "zstd_l5": ["zstd", "-T", str(max(1, threads)), "-5", "-c"],
-        "zstd_l9": ["zstd", "-T", str(max(1, threads)), "-9", "-c"],
-        "zstd_l12": ["zstd", "-T", str(max(1, threads)), "-12", "-c"],
-        
-        # Brotli 系列 (高压缩)
-        "brotli_l4": ["brotli", "-q", "4", "-c"]
-    }
-    
-    # 默认回退
-    return algo_map.get(algo_name, ["zstd", "-T", str(threads), "-3", "-c"])
-
 def _build_decompress_command(algo_name: str) -> list:
-    """构建解压命令"""
-    algo_map = {
-        "gzip": ["pigz", "-d", "-c"],
-        "gzip_fast": ["pigz", "-d", "-c"],
-        "lz4": ["lz4", "-d", "-c"],
-        "lz4_high": ["lz4", "-d", "-c"],
-        "brotli_l4": ["brotli", "-d", "-c"],
-    }
-    # zstd 可以自动识别，其他默认用 zstd -d
-    if "zstd" in algo_name:
+    """构建解压命令（根据预压缩文件后缀）"""
+    if "gzip" in algo_name:
+        return ["pigz", "-d", "-c"]
+    elif "lz4" in algo_name:
+        return ["lz4", "-d", "-c"]
+    elif "brotli" in algo_name:
+        return ["brotli", "-d", "-c"]
+    else:  # zstd
         return ["zstd", "-d", "-c"]
-    return algo_map.get(algo_name, ["zstd", "-d", "-c"])
+
+def _get_precompressed_path(image_name: str, algo_suffix: str) -> Optional[Path]:
+    """
+    查找预压缩文件路径
+    输入：image_name="ubuntu:latest", algo_suffix="zstd-3"
+    输出：/cts/data/preprocessed_images/ubuntu_latest.tar.zstd-3
+    """
+    safe_name = image_name.replace(":", "_").replace("/", "_")
+    precompressed_file = PRECOMPRESSED_DIR / f"{safe_name}.tar.{algo_suffix}"
+    
+    if precompressed_file.exists():
+        logger.info(f"✅ [CTS] 找到预压缩文件: {precompressed_file.name} ({precompressed_file.stat().st_size / 1024 / 1024:.2f}MB)")
+        return precompressed_file
+    else:
+        logger.error(f"❌ [CTS] 预压缩文件不存在: {precompressed_file.name}")
+        return None
 
 def _run_cts_pipeline(
     image_name: str, 
@@ -134,73 +142,50 @@ def _run_cts_pipeline(
     threads: int
 ) -> Tuple[bool, float, str]:
     """
-    执行真实的 CTS 流水线：
-    Save -> Compress -> Decompress -> Load
+    优化后的 CTS 流水线：
+    1. 查找预压缩文件（跳过 docker save 和实时压缩）
+    2. 直接解压预压缩文件
+    3. Docker Load
     """
     temp_dir = Path("/tmp/cts")
     temp_dir.mkdir(exist_ok=True)
-    tar_path = temp_dir / f"img_{os.getpid()}.tar"
     
     total_start = time.perf_counter()
-    error_msg = ""
     success = False
+    error_msg = ""
 
     try:
-        # 1. Docker Save (获取原始镜像数据流)
-        logger.info(f"[CTS] Step 1/4: docker save {image_name}...")
-        t_save = time.perf_counter()
-        try:
-            with open(tar_path, 'wb') as f:
-                result = subprocess.run(
-                    ["docker", "save", image_name],
-                    stdout=f, stderr=subprocess.PIPE, check=True, timeout=600
-                )
-            save_time = time.perf_counter() - t_save
-            logger.info(f"[CTS] Save done: {save_time:.2f}s")
-        except subprocess.CalledProcessError as e:
-            # 🔧 新增：打印docker save的具体错误
-            logger.error(f"❌ docker save 失败: {e.stderr.decode()[:200]}")
-            raise  # 继续抛出异常，让外层处理
-        except Exception as e:
-            logger.error(f"❌ docker save 异常: {str(e)[:200]}")
-            raise
+        # ==========================================
+        # 🔧 核心优化：直接使用预压缩文件
+        # ==========================================
+        # Step 1: 映射 algo_name 到预压缩文件后缀
+        algo_suffix = ALGO_TO_PRECOMPRESSED_SUFFIX.get(algo_name, "zstd-3")
+        
+        # Step 2: 查找预压缩文件
+        precompressed_path = _get_precompressed_path(image_name, algo_suffix)
+        if not precompressed_path:
+            return False, 0.0, f"预压缩文件不存在: {algo_suffix}"
 
-        # 2. 压缩 (应用决策)
-        logger.info(f"[CTS] Step 2/4: Compressing with {algo_name} @ {threads} threads...")
-        t_comp = time.perf_counter()
-        
-        # 构建命令
-        comp_cmd = _build_compress_command(algo_name, threads, str(tar_path), "")
-        comp_path = tar_path.with_suffix(f".tar.{algo_name.split('_')[0]}")
-        
-        with open(tar_path, 'rb') as f_in:
-            with open(comp_path, 'wb') as f_out:
-                p1 = subprocess.Popen(comp_cmd, stdin=f_in, stdout=f_out, stderr=subprocess.PIPE)
-                _, err = p1.communicate(timeout=600)
-        
-        if p1.returncode != 0:
-            logger.warning(f"Compress warning: {err.decode()[:200]}")
-            
-        comp_time = time.perf_counter() - t_comp
-        logger.info(f"[CTS] Compress done: {comp_time:.2f}s")
-
-        # 3. 解压 (模拟接收端)
-        logger.info(f"[CTS] Step 3/4: Decompressing...")
+        # Step 3: 直接解压预压缩文件（模拟接收端）
+        logger.info(f"[CTS] Step 1/2: 解压预压缩文件...")
         t_decomp = time.perf_counter()
         
-        decomp_cmd = _build_decompress_command(algo_name)
-        recovered_tar = tar_path.with_suffix(".recovered.tar")
+        decomp_cmd = _build_decompress_command(algo_suffix)
+        recovered_tar = temp_dir / f"img_{os.getpid()}.recovered.tar"
         
-        with open(comp_path, 'rb') as f_in:
+        with open(precompressed_path, 'rb') as f_in:
             with open(recovered_tar, 'wb') as f_out:
                 p2 = subprocess.Popen(decomp_cmd, stdin=f_in, stdout=f_out, stderr=subprocess.PIPE)
                 _, err2 = p2.communicate(timeout=600)
         
+        if p2.returncode != 0:
+            logger.warning(f"解压警告: {err2.decode()[:200]}")
+            
         decomp_time = time.perf_counter() - t_decomp
-        logger.info(f"[CTS] Decompress done: {decomp_time:.2f}s")
+        logger.info(f"[CTS] 解压完成: {decomp_time:.2f}s")
 
-        # 4. Docker Load
-        logger.info(f"[CTS] Step 4/4: docker load...")
+        # Step 4: Docker Load
+        logger.info(f"[CTS] Step 2/2: docker load...")
         t_load = time.perf_counter()
         
         with open(recovered_tar, 'rb') as f:
@@ -215,10 +200,8 @@ def _run_cts_pipeline(
         total_time = time.perf_counter() - total_start
         success = True
         
-        # 清理临时文件（无论成功失败都清理）
+        # 清理临时文件
         try:
-            tar_path.unlink(missing_ok=True)
-            comp_path.unlink(missing_ok=True)
             recovered_tar.unlink(missing_ok=True)
             logger.info(f"[CTS] 临时文件已清理")
         except Exception as e:
@@ -227,19 +210,13 @@ def _run_cts_pipeline(
         return success, total_time, ""
 
     except subprocess.TimeoutExpired:
-        # 🔧 新增：超时也清理临时文件
         try:
-            tar_path.unlink(missing_ok=True)
-            comp_path.unlink(missing_ok=True)
             recovered_tar.unlink(missing_ok=True)
         except:
             pass
         return False, 0.0, "Timeout"
     except Exception as e:
-        # 🔧 新增：异常也清理临时文件
         try:
-            tar_path.unlink(missing_ok=True)
-            comp_path.unlink(missing_ok=True)
             recovered_tar.unlink(missing_ok=True)
         except:
             pass
@@ -251,7 +228,7 @@ def cts_download(
     threads: Optional[int] = None,
     env_state: Optional[Dict] = None,
     image_features: Optional[Dict] = None,
-    clear_cache: bool = False  # 🔧 核心修改：默认不清理缓存！避免删掉刚拉取的镜像
+    clear_cache: bool = False
 ) -> Dict[str, Any]:
     
     start_total = time.perf_counter()
@@ -270,7 +247,7 @@ def cts_download(
     if image_features is None:
         image_features = _get_image_features(image_name)
     
-    # 补充物理特征 (必须与训练一致)
+    # 补充物理特征
     img_size = image_features.get('total_size_mb', 100.0)
     env_state['theoretical_time'] = img_size / (env_state.get('bandwidth_mbps', 100) / 8 + 1e-8)
     env_state['cpu_to_size_ratio'] = env_state.get('cpu_limit', 4.0) / (img_size + 1e-8)
@@ -300,15 +277,7 @@ def cts_download(
                 final_algo = "zstd_l3"
                 final_threads = 4
 
-    # 3. 执行真实物理流程
-    # 注意：这里我们分两种模式
-    # Mode A: 如果是 Baseline 对比，我们直接 docker pull
-    # Mode B: 如果是 CTS，我们跑 Save-Compress-Load 循环
-    
-    # 为了让 exp1 能对比，我们这里加一个逻辑：
-    # 如果 strategy 显式传入 'baseline' 或 'gzip' 且 threads==1，我们直接 pull
-    # 否则跑 CTS 流程
-    
+    # 3. 执行流程
     use_native_pull = (strategy == "baseline") or (strategy == "gzip" and threads == 1)
     
     if use_native_pull:
@@ -316,12 +285,10 @@ def cts_download(
         logger.info(f"[Baseline] 执行原生 docker pull...")
         t0 = time.time()
         try:
-            # 🔧 新增：捕获完整输出，避免NoneType
             result = subprocess.run(
                 ["docker", "pull", image_name],
                 capture_output=True, text=True, timeout=600
             )
-            # 🔧 新增：判断result是否为None
             if result is None:
                 return {
                     "strategy": "Baseline",
@@ -332,7 +299,6 @@ def cts_download(
                     "success": False,
                     "error": "Docker Pull返回空结果"
                 }
-            # 🔧 新增：判断返回码
             if result.returncode == 0:
                 total_time = time.time() - t0
                 return {
@@ -366,7 +332,7 @@ def cts_download(
                 "error": str(e)[:200]
             }
     else:
-        # CTS 模式 (真实压缩流程)
+        # CTS 模式 (使用预压缩文件)
         success, total_time, error = _run_cts_pipeline(image_name, final_algo, final_threads)
         
         return {
