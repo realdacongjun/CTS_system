@@ -132,7 +132,8 @@ def verify_model_config() -> bool:
     2. 修复preprocess_path笔误（运行时临时修正）
     3. 检查10种策略是否在候选列表中
     """
-    model_config_path = CTS_ROOT / "configs" / "model_config.yaml"
+    model_config_path = "/cts/tests/configs/model_config.yaml"
+    # model_config_path = CTS_ROOT / "configs" / "model_config.yaml"
     if not model_config_path.exists():
         logger.error(f"模型配置文件不存在: {model_config_path}")
         return False
