@@ -1,4 +1,4 @@
-FROM ubuntu:20.04
+FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /cts
@@ -59,3 +59,4 @@ ENV LANG=C.UTF-8
 ENV PYTHONPATH=/cts/src:/cts:/cts/testbed:$PYTHONPATH
 
 CMD ["sleep", "infinity"]
+
