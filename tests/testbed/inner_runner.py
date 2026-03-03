@@ -131,24 +131,41 @@ def setup_network(scene_cfg: Dict[str, Any]) -> bool:
 
 
 
+# def verify_model_config() -> bool:
+#     """
+#     验证model_config.yaml的完整性：
+#     1. 检查文件是否存在
+#     2. 修复preprocess_path笔误（运行时临时修正）
+#     3. 检查10种策略是否在候选列表中
+#     """
+#     model_cfg_path = "/cts/tests/configs/model_config.yaml"
+#     model_config_path = Path(model_cfg_path)
+#     if not model_config_path.exists():
+#         logger.error(f"模型配置文件不存在: {model_config_path}")
+#         return False
+    
+#     # 加载并修复笔误
+#     try:
+#         with open(model_config_path, "r", encoding="utf-8") as f:
+#             model_config = yaml.safe_load(f)
+        
 def verify_model_config() -> bool:
     """
-    验证model_config.yaml的完整性：
+    验证 model_config.yaml 的完整性：
     1. 检查文件是否存在
-    2. 修复preprocess_path笔误（运行时临时修正）
-    3. 检查10种策略是否在候选列表中
+    2. 修复 preprocess_path 笔误（运行时临时修正）
+    3. 检查 10 种策略是否在候选列表中
     """
-    model_cfg_path = "/cts/tests/configs/model_config.yaml"
+    model_cfg_path = "/cts/configs/model_config.yaml"
     model_config_path = Path(model_cfg_path)
     if not model_config_path.exists():
-        logger.error(f"模型配置文件不存在: {model_config_path}")
+        logger.error(f"模型配置文件不存在：{model_config_path}")
         return False
     
     # 加载并修复笔误
     try:
         with open(model_config_path, "r", encoding="utf-8") as f:
             model_config = yaml.safe_load(f)
-        
         # 修复preprocess_path → preprocessing_path
         if "preprocess_path" in model_config and "preprocessing_path" not in model_config:
             model_config["preprocessing_path"] = model_config.pop("preprocess_path")
