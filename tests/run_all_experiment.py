@@ -247,11 +247,11 @@ def execute_experiment_in_container(
     """执行容器内实验（适配inner_runner.py的逻辑：单个场景只执行一次）"""
     logger.info(f"在容器{container_name}中执行场景{scene_name}的所有实验")
 
-    # 🔧 核心修正：只传inner_runner.py认识的两个参数
+    # 🔧 核心修正：修正 inner_runner.py 的路径
     exec_cmd = [
         "docker", "exec", "--user", "root",  # 用root执行，解决docker/pull权限问题
         container_name,
-        "python", "/cts/testbed/inner_runner.py",
+        "python", "/cts/inner_runner.py",  # ✅ 正确路径：tests/inner_runner.py → /cts/inner_runner.py
         "--scene-name", scene_name,
         "--config-path", "/cts/configs/config.yaml"  # 指向正确的配置文件
     ]
@@ -276,7 +276,6 @@ def execute_experiment_in_container(
     except Exception as e:
         logger.error(f"场景{scene_name}实验执行异常：{e}", exc_info=True)
         return False
-
 def stop_experiment_container(container_name: str) -> bool:
     """停止容器"""
     logger.info(f"停止容器：{container_name}")
