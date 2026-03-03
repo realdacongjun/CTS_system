@@ -35,14 +35,14 @@ RUN echo "ctsuser ALL=(ALL) NOPASSWD: /usr/sbin/tc" >> /etc/sudoers && \
     chown -R ctsuser:ctsuser /cts && \
     chmod -R 755 /cts
 
-# 🔧 步骤3：安装 Python 依赖（包括 psutil）
+
 RUN pip install --no-cache-dir --upgrade pip==22.0.4 -i https://pypi.tuna.tsinghua.edu.cn/simple && \
     pip install --no-cache-dir \
     -i https://pypi.tuna.tsinghua.edu.cn/simple \
     --extra-index-url https://download.pytorch.org/whl/cpu \
     requests==2.31.0 \
     pandas==1.5.3 \
-    numpy==1.24.4 \
+    numpy==2.0.2 \  
     pyyaml==6.0.1 \
     psutil==5.9.5 \         
     torch==1.13.1 \
