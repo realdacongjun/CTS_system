@@ -36,13 +36,18 @@ RUN echo "ctsuser ALL=(ALL) NOPASSWD: /usr/sbin/tc" >> /etc/sudoers && \
     chmod -R 755 /cts
 
 
-RUN pip install --no-cache-dir --upgrade pip==22.0.4 -i https://pypi.tuna.tsinghua.edu.cn/simple && \
-    pip install --no-cache-dir \
-    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+# 🔧 优化 pip 下载参数，解决超时问题
+RUN pip install --no-cache-dir --upgrade pip==22.0.4 -i https://mirrors.aliyun.com/pypi/simple/ && \
+    # 先单独下载 NumPy（大文件优先，增加超时和重试）
+    pip install --no-cache-dir --default-timeout=1000 --retries=5 \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
+    numpy==2.0.2 && \
+    # 再装其他依赖
+    pip install --no-cache-dir --default-timeout=1000 --retries=5 \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
     --extra-index-url https://download.pytorch.org/whl/cpu \
     requests==2.31.0 \
     pandas==1.5.3 \
-    numpy==2.0.2 \  
     pyyaml==6.0.1 \
     psutil==5.9.5 \         
     torch==1.13.1 \
@@ -59,4 +64,5 @@ ENV LANG=C.UTF-8
 ENV PYTHONPATH=/cts/src:/cts:/cts/testbed:$PYTHONPATH
 
 CMD ["sleep", "infinity"]
+
 
