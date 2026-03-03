@@ -239,6 +239,8 @@ def start_experiment_container(scene_name: str, scene_config: Dict, image_name: 
         logger.error(f"错误详情：{e.stderr if hasattr(e, 'stderr') else '无'}")
         return None
 
+
+
 def execute_experiment_in_container(
     container_name: str, 
     scene_name: str,
@@ -247,13 +249,13 @@ def execute_experiment_in_container(
     """执行容器内实验（适配inner_runner.py的逻辑：单个场景只执行一次）"""
     logger.info(f"在容器{container_name}中执行场景{scene_name}的所有实验")
 
-    # 🔧 核心修正：修正 inner_runner.py 的路径
+    # 🔧 最终终极修正：inner_runner.py 的准确路径
     exec_cmd = [
-        "docker", "exec", "--user", "root",  # 用root执行，解决docker/pull权限问题
+        "docker", "exec", "--user", "root",
         container_name,
-        "python", "/cts/inner_runner.py",  # ✅ 正确路径：tests/inner_runner.py → /cts/inner_runner.py
+        "python", "/cts/tests/testbed/inner_runner.py",  # ✅ 100%正确路径！
         "--scene-name", scene_name,
-        "--config-path", "/cts/configs/config.yaml"  # 指向正确的配置文件
+        "--config-path", "/cts/tests/configs/config.yaml"  # 确认config.yaml路径也正确
     ]
 
     try:
@@ -263,7 +265,7 @@ def execute_experiment_in_container(
             stderr=subprocess.PIPE, 
             check=True, 
             encoding="utf-8",
-            timeout=10800  # 场景级超时（3小时，适配mysql大镜像）
+            timeout=10800
         )
         logger.info(f"场景{scene_name}所有实验执行成功，输出摘要：{result.stdout[:500]}")
         return True
@@ -276,6 +278,8 @@ def execute_experiment_in_container(
     except Exception as e:
         logger.error(f"场景{scene_name}实验执行异常：{e}", exc_info=True)
         return False
+
+
 def stop_experiment_container(container_name: str) -> bool:
     """停止容器"""
     logger.info(f"停止容器：{container_name}")
@@ -403,3 +407,29 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+# 1. 回到 tests 目录
+cd /root/CTS_system/tests/
+
+# 2. 停止旧进程和容器
+pkill -f run_all_experiment.py 2>/dev/null || true
+docker stop $(docker ps -a | grep cts-run- | awk '{print $1}') 2>/dev/null || true
+docker rm -f $(docker ps -a | grep cts-run- | awk '{print $1}') 2>/dev/null || true
+
+# 3. 清空旧日志
+rm -f *.log
+
+# 4. 备份并清空旧 results
+mv /root/CTS_system/tests/results /root/CTS_system/tests/results_backup_$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
+mkdir -p /root/CTS_system/tests/results
+
+# 5. 重新运行实验（只跑1轮，快速验证）
+nohup python run_all_experiment.py --skip-build --repeat-times 1 --images ubuntu:latest > full_experiment.log 2>&1 &
+
+# 6. 查看后台进程
+ps aux | grep run_all
+
+# 7. 跟踪日志
+tail -f full_experiment.log
