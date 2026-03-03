@@ -64,5 +64,3 @@ ENV PYTHONPATH=/cts/src:/cts:/cts/testbed:$PYTHONPATH
 
 CMD ["sleep", "infinity"]
 
-# cd /root/CTS_system/tests/testbed/
-# docker build --no-cache -t cts-testbed:latest .

@@ -6,6 +6,7 @@ CTS闭环实验总控脚本（适配新版架构）
 1. 简化配置加载（适配 model_wrapper 的新逻辑）
 2. 统一导入路径（去掉 src. 前缀）
 3. 适配 inner_runner.py 的参数逻辑（仅传 --scene-name 和 --config-path）
+4. 对齐预压缩文件路径、镜像列表、场景参数
 """
 import os
 import sys
@@ -21,10 +22,14 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
-# 🔧 核心修正1：合并重复的PROJECT_ROOT定义，统一路径配置
+# 🔧 核心修正1：正确计算PROJECT_ROOT（适配你的目录结构）
+# 假设该脚本在 /root/CTS_system/tests/ 下，PROJECT_ROOT = tests目录
 PROJECT_ROOT = Path(__file__).parent.absolute()
-# 宿主机的预压缩镜像目录（在CTS_system根目录下的data）
+# 宿主机的预压缩镜像目录（根目录的data/preprocessed_images）
 HOST_PRECOMPRESSED_DATA_DIR = PROJECT_ROOT.parent / "data" / "preprocessed_images"
+# 验证预压缩目录是否存在
+if not HOST_PRECOMPRESSED_DATA_DIR.exists():
+    raise FileNotFoundError(f"预压缩文件目录不存在：{HOST_PRECOMPRESSED_DATA_DIR}，请先执行prepare_images.py")
 
 # 统一添加系统路径
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -69,20 +74,22 @@ def load_config() -> dict:
             with open(config_path, 'r', encoding='utf-8') as f:
                 return yaml.safe_load(f)
     
-    logger.warning("未找到配置文件，使用默认配置")
+    logger.warning("未找到配置文件，使用默认配置（对齐你的实验参数）")
     return {
         "paths": {
             "results_file": str(RESULTS_DIR / "experiment_results.csv"),
             "image_features_csv": str(CONTAINER_DATA_DIR / "image_features_database.csv")
         },
         "experiment": {
-            "repeat_times": 1,
-            "images": ["alpine:latest", "nginx:alpine"],
-            "timeout": 3600
+            "repeat_times": 3,  # 对齐你的实验轮次（3次）
+            "images": ["ubuntu:latest", "nginx:latest", "mysql:latest"],  # 对齐你的镜像列表
+            "timeout": 3600  # 单个实验超时时间
         },
         "scenes": {
-            "S1_Normal": {"bandwidth": "100mbit", "delay": "10ms", "cpus": 4.0, "memory": "8g"},
-            "S2_WeakNet": {"bandwidth": "5mbit", "delay": "100ms", "cpus": 2.0, "memory": "4g"}
+            # 对齐你的实验场景参数
+            "S1_Normal": {"bandwidth": "100mbit", "delay": "10ms", "cpus": 6.0, "memory": "12g"},
+            "S2_WeakNet": {"bandwidth": "5mbit", "delay": "100ms", "cpus": 2.0, "memory": "4g"},
+            "S3_Robust": {"bandwidth": "1mbit", "delay": "500ms", "cpus": 1.0, "memory": "4g", "packet_loss": 10.0}
         }
     }
 
@@ -124,16 +131,19 @@ def collect_env_state(scene_config: Dict = None) -> dict:
     """采集环境状态（保持原有逻辑）"""
     bandwidth_mbps = 100.0
     network_rtt = 20.0
+    packet_loss = 0.0
     if scene_config:
         if 'bandwidth' in scene_config and 'mbit' in scene_config['bandwidth']:
             bandwidth_mbps = float(scene_config['bandwidth'].replace('mbit', ''))
         if 'delay' in scene_config and 'ms' in scene_config['delay']:
             network_rtt = float(scene_config['delay'].replace('ms', ''))
+        if 'packet_loss' in scene_config:
+            packet_loss = float(scene_config['packet_loss'])
     
     return {
         'bandwidth_mbps': bandwidth_mbps,
         'network_rtt': network_rtt,
-        'packet_loss': 0.0,
+        'packet_loss': packet_loss,
         'cpu_limit': float(psutil.cpu_count(logical=True)),
         'mem_limit_mb': float(psutil.virtual_memory().total / 1024 / 1024)
     }
@@ -157,7 +167,7 @@ def get_test_matrix(config: dict) -> Dict:
     test_matrix = config.get('scenes', {})
     if not test_matrix:
         test_matrix = {
-            "S1_Normal": {"cpus": 4.0, "memory": "8g", "bandwidth": "100mbit", "delay": "10ms"}
+            "S1_Normal": {"cpus": 6.0, "memory": "12g", "bandwidth": "100mbit", "delay": "10ms"}
         }
     
     for scene_name in test_matrix:
@@ -194,7 +204,7 @@ def build_testbed_image(image_name: str = "cts-testbed:latest") -> bool:
         return False
 
 def start_experiment_container(scene_name: str, scene_config: Dict, image_name: str = "cts-testbed:latest") -> Optional[str]:
-    """启动实验容器"""
+    """启动实验容器（核心修改：修正预压缩文件挂载路径）"""
     container_name = f"cts-run-{scene_name}"
     logger.info(f"启动实验容器：{container_name}")
 
@@ -208,20 +218,25 @@ def start_experiment_container(scene_name: str, scene_config: Dict, image_name: 
         run_cmd = [
             "docker", "run", "-d", "--name", container_name,
             f"--cpus={scene_config['cpus']}", f"--memory={scene_config['memory']}",
-            "--network=host", "--privileged",
-            # 🔧 核心修正：正确挂载所有必要目录
-            "-v", f"{PROJECT_ROOT}:/cts",  # 挂载tests目录到容器/cts
-            "-v", f"{HOST_PRECOMPRESSED_DATA_DIR}:/cts/data/preprocessed_images",  # 挂载预压缩镜像目录
-            "-v", "/var/run/docker.sock:/var/run/docker.sock",  # 挂载docker sock
+            "--network=host", "--privileged",  # 特权模式解决网络/权限问题
+            # 核心修正1：挂载项目根目录到/cts
+            "-v", f"{PROJECT_ROOT.parent}:/cts",  
+            # 核心修正2：预压缩文件挂载到实验脚本找的路径 /cts/precompressed_images
+            "-v", f"{HOST_PRECOMPRESSED_DATA_DIR}:/cts/precompressed_images",  
+            # 挂载docker sock，确保容器内可执行docker命令
+            "-v", "/var/run/docker.sock:/var/run/docker.sock",  
+            # 环境变量：指定预压缩文件路径
+            "-e", "PRECOMPRESSED_IMAGES_DIR=/cts/precompressed_images",
             image_name, "sleep", "infinity"
         ]
         result = subprocess.run(run_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, encoding="utf-8")
-        logger.info(f"容器启动成功")
+        logger.info(f"容器启动成功，命令：{' '.join(run_cmd)}")
         time.sleep(2)  # 等待容器完全启动
         return container_name
     except Exception as e:
         logger.error(f"容器启动失败：{e}")
-        logger.error(f"启动错误详情：{e.stderr if hasattr(e, 'stderr') else '无'}")
+        logger.error(f"启动命令：{' '.join(run_cmd)}")
+        logger.error(f"错误详情：{e.stderr if hasattr(e, 'stderr') else '无'}")
         return None
 
 def execute_experiment_in_container(
@@ -234,7 +249,7 @@ def execute_experiment_in_container(
 
     # 🔧 核心修正：只传inner_runner.py认识的两个参数
     exec_cmd = [
-        "docker", "exec", "--user", "root",  # 解决权限问题
+        "docker", "exec", "--user", "root",  # 用root执行，解决docker/pull权限问题
         container_name,
         "python", "/cts/testbed/inner_runner.py",
         "--scene-name", scene_name,
@@ -248,7 +263,7 @@ def execute_experiment_in_container(
             stderr=subprocess.PIPE, 
             check=True, 
             encoding="utf-8",
-            timeout=3600  # 场景级超时（可根据需要调整）
+            timeout=10800  # 场景级超时（3小时，适配mysql大镜像）
         )
         logger.info(f"场景{scene_name}所有实验执行成功，输出摘要：{result.stdout[:500]}")
         return True
@@ -323,7 +338,7 @@ def run_all_experiments(skip_build: bool = False, config: dict = None) -> bool:
     """主实验流程（适配inner_runner.py的逻辑）"""
     if config is None:
         config = load_config()
-    logger.info(f"📌 实验配置：重复次数={config['experiment']['repeat_times']}")
+    logger.info(f"📌 实验配置：重复次数={config['experiment']['repeat_times']}，镜像列表={config['experiment']['images']}")
 
     if not skip_build:
         if not build_testbed_image():
