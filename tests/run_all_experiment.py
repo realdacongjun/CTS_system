@@ -203,6 +203,32 @@ def build_testbed_image(image_name: str = "cts-testbed:latest") -> bool:
         logger.error(f"构建错误详情：{e.stderr if hasattr(e, 'stderr') else '无'}")
         return False
 
+# def start_experiment_container(scene_name: str, scene_config: Dict, image_name: str = "cts-testbed:latest") -> Optional[str]:
+#     """启动实验容器（核心修改：修正预压缩文件挂载路径）"""
+#     container_name = f"cts-run-{scene_name}"
+#     logger.info(f"启动实验容器：{container_name}")
+
+#     # 先清理旧容器
+#     try:
+#         subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+#     except Exception as e:
+#         logger.warning(f"清理旧容器失败：{e}")
+
+#     try:
+#         run_cmd = [
+#             "docker", "run", "-d", "--name", container_name,
+#             f"--cpus={scene_config['cpus']}", f"--memory={scene_config['memory']}",
+#             "--network=host", "--privileged",  # 特权模式解决网络/权限问题
+#             # 核心修正1：挂载项目根目录到/cts
+#             "-v", f"{PROJECT_ROOT.parent}:/cts",  
+#             # 核心修正2：预压缩文件挂载到实验脚本找的路径 /cts/precompressed_images
+#             "-v", f"{HOST_PRECOMPRESSED_DATA_DIR}:/cts/precompressed_images",  
+#             # 挂载docker sock，确保容器内可执行docker命令
+#             "-v", "/var/run/docker.sock:/var/run/docker.sock",  
+#             # 环境变量：指定预压缩文件路径
+#             "-e", "PRECOMPRESSED_IMAGES_DIR=/cts/precompressed_images",
+#             image_name, "sleep", "infinity"
+#         ]
 def start_experiment_container(scene_name: str, scene_config: Dict, image_name: str = "cts-testbed:latest") -> Optional[str]:
     """启动实验容器（核心修改：修正预压缩文件挂载路径）"""
     container_name = f"cts-run-{scene_name}"
@@ -218,17 +244,16 @@ def start_experiment_container(scene_name: str, scene_config: Dict, image_name: 
         run_cmd = [
             "docker", "run", "-d", "--name", container_name,
             f"--cpus={scene_config['cpus']}", f"--memory={scene_config['memory']}",
-            "--network=host", "--privileged",  # 特权模式解决网络/权限问题
-            # 核心修正1：挂载项目根目录到/cts
-            "-v", f"{PROJECT_ROOT.parent}:/cts",  
-            # 核心修正2：预压缩文件挂载到实验脚本找的路径 /cts/precompressed_images
+            "--network=host", "--privileged",
+            # 🔧 核心修正：使用绝对路径挂载 tests目录到/cts
+            "-v", f"{PROJECT_ROOT}:/cts",  
+            # 预压缩文件挂载
             "-v", f"{HOST_PRECOMPRESSED_DATA_DIR}:/cts/precompressed_images",  
-            # 挂载docker sock，确保容器内可执行docker命令
             "-v", "/var/run/docker.sock:/var/run/docker.sock",  
-            # 环境变量：指定预压缩文件路径
             "-e", "PRECOMPRESSED_IMAGES_DIR=/cts/precompressed_images",
             image_name, "sleep", "infinity"
         ]
+
         result = subprocess.run(run_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, encoding="utf-8")
         logger.info(f"容器启动成功，命令：{' '.join(run_cmd)}")
         time.sleep(2)  # 等待容器完全启动
@@ -411,26 +436,26 @@ if __name__ == "__main__":
 
 
 
-# # 1. 回到 tests 目录
-# cd /root/CTS_system/tests/
+# 1. 回到 tests 目录
+cd /root/CTS_system/tests/
 
-# # 2. 停止旧进程和容器
-# pkill -f run_all_experiment.py 2>/dev/null || true
-# docker stop $(docker ps -a | grep cts-run- | awk '{print $1}') 2>/dev/null || true
-# docker rm -f $(docker ps -a | grep cts-run- | awk '{print $1}') 2>/dev/null || true
+# 2. 停止旧进程和容器
+pkill -f run_all_experiment.py 2>/dev/null || true
+docker stop $(docker ps -a | grep cts-run- | awk '{print $1}') 2>/dev/null || true
+docker rm -f $(docker ps -a | grep cts-run- | awk '{print $1}') 2>/dev/null || true
 
-# # 3. 清空旧日志
-# rm -f *.log
+# 3. 清空旧日志
+rm -f *.log
 
-# # 4. 备份并清空旧 results
-# mv /root/CTS_system/tests/results /root/CTS_system/tests/results_backup_$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
-# mkdir -p /root/CTS_system/tests/results
+# 4. 备份并清空旧 results
+mv /root/CTS_system/tests/results /root/CTS_system/tests/results_backup_$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
+mkdir -p /root/CTS_system/tests/results
 
-# # 5. 重新运行实验（只跑1轮，快速验证）
-# nohup python run_all_experiment.py --skip-build --repeat-times 1 --images ubuntu:latest > full_experiment.log 2>&1 &
+# 5. 重新运行实验（只跑1轮，快速验证）
+nohup python run_all_experiment.py --skip-build --repeat-times 1 --images ubuntu:latest > full_experiment.log 2>&1 &
 
-# # 6. 查看后台进程
-# ps aux | grep run_all
+# 6. 查看后台进程
+ps aux | grep run_all
 
-# # 7. 跟踪日志
-# tail -f full_experiment.log
+# 7. 跟踪日志
+tail -f full_experiment.log

@@ -172,8 +172,11 @@ def verify_model_config() -> bool:
 # testbed/inner_runner.py
 # ... (前面部分保持不变) ...
 
+# def run_experiment_script(experiment_name: str, scene_cfg: Dict[str, Any]) -> Dict[str, Any]:
+#     script_path = Path(CTS_ROOT / "tests" / "experiments" / f"{experiment_name}.py") 
+#     if not script_path.exists():
 def run_experiment_script(experiment_name: str, scene_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    script_path = Path(CTS_ROOT / "tests" / "experiments" / f"{experiment_name}.py") 
+    script_path = Path(CTS_ROOT / "experiments" / f"{experiment_name}.py") 
     if not script_path.exists():
         error_msg = f"实验脚本不存在: {script_path}"
         logger.error(error_msg)
