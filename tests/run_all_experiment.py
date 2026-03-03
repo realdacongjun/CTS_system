@@ -266,21 +266,39 @@ def start_experiment_container(scene_name: str, scene_config: Dict, image_name: 
 
 
 
+# def execute_experiment_in_container(
+#     container_name: str, 
+#     scene_name: str,
+#     config: dict
+# ) -> bool:
+#     """执行容器内实验（适配inner_runner.py的逻辑：单个场景只执行一次）"""
+#     logger.info(f"在容器{container_name}中执行场景{scene_name}的所有实验")
+
+#     # 🔧 最终终极修正：inner_runner.py 的准确路径
+#     exec_cmd = [
+#         "docker", "exec", "--user", "root",
+#         container_name,
+#         "python", "/cts/tests/testbed/inner_runner.py",  # ✅ 100%正确路径！
+#         "--scene-name", scene_name,
+#         "--config-path", "/cts/tests/configs/config.yaml"  # 确认config.yaml路径也正确
+#     ]
+
+#     try:
 def execute_experiment_in_container(
     container_name: str, 
     scene_name: str,
     config: dict
 ) -> bool:
-    """执行容器内实验（适配inner_runner.py的逻辑：单个场景只执行一次）"""
+    """执行容器内实验（适配 inner_runner.py 的逻辑：单个场景只执行一次）"""
     logger.info(f"在容器{container_name}中执行场景{scene_name}的所有实验")
 
-    # 🔧 最终终极修正：inner_runner.py 的准确路径
+    # 🔧 修正：挂载点是 /cts，对应 /root/CTS_system/tests
     exec_cmd = [
         "docker", "exec", "--user", "root",
         container_name,
-        "python", "/cts/tests/testbed/inner_runner.py",  # ✅ 100%正确路径！
+        "python", "/cts/testbed/inner_runner.py",
         "--scene-name", scene_name,
-        "--config-path", "/cts/tests/configs/config.yaml"  # 确认config.yaml路径也正确
+        "--config-path", "/cts/configs/config.yaml"
     ]
 
     try:
