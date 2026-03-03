@@ -436,26 +436,26 @@ if __name__ == "__main__":
 
 
 
-# 1. 回到 tests 目录
-cd /root/CTS_system/tests/
+# # 1. 回到 tests 目录
+# cd /root/CTS_system/tests/
 
-# 2. 停止旧进程和容器
-pkill -f run_all_experiment.py 2>/dev/null || true
-docker stop $(docker ps -a | grep cts-run- | awk '{print $1}') 2>/dev/null || true
-docker rm -f $(docker ps -a | grep cts-run- | awk '{print $1}') 2>/dev/null || true
+# # 2. 停止旧进程和容器
+# pkill -f run_all_experiment.py 2>/dev/null || true
+# docker stop $(docker ps -a | grep cts-run- | awk '{print $1}') 2>/dev/null || true
+# docker rm -f $(docker ps -a | grep cts-run- | awk '{print $1}') 2>/dev/null || true
 
-# 3. 清空旧日志
-rm -f *.log
+# # 3. 清空旧日志
+# rm -f *.log
 
-# 4. 备份并清空旧 results
-mv /root/CTS_system/tests/results /root/CTS_system/tests/results_backup_$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
-mkdir -p /root/CTS_system/tests/results
+# # 4. 备份并清空旧 results
+# mv /root/CTS_system/tests/results /root/CTS_system/tests/results_backup_$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
+# mkdir -p /root/CTS_system/tests/results
 
-# 5. 重新运行实验（只跑1轮，快速验证）
-nohup python run_all_experiment.py --skip-build --repeat-times 1 --images ubuntu:latest > full_experiment.log 2>&1 &
+# # 5. 重新运行实验（只跑1轮，快速验证）
+# nohup python run_all_experiment.py --skip-build --repeat-times 1 --images ubuntu:latest > full_experiment.log 2>&1 &
 
-# 6. 查看后台进程
-ps aux | grep run_all
+# # 6. 查看后台进程
+# ps aux | grep run_all
 
-# 7. 跟踪日志
-tail -f full_experiment.log
+# # 7. 跟踪日志
+# tail -f full_experiment.log
