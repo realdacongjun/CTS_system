@@ -125,6 +125,12 @@ def setup_network(scene_cfg: Dict[str, Any]) -> bool:
         logger.error(f"网络配置失败: {e}")
         return False
 
+
+
+
+
+
+
 def verify_model_config() -> bool:
     """
     验证model_config.yaml的完整性：
@@ -132,8 +138,8 @@ def verify_model_config() -> bool:
     2. 修复preprocess_path笔误（运行时临时修正）
     3. 检查10种策略是否在候选列表中
     """
-    model_config_path = "/cts/tests/configs/model_config.yaml"
-    # model_config_path = CTS_ROOT / "configs" / "model_config.yaml"
+    model_cfg_path = "/cts/tests/configs/model_config.yaml"
+    model_config_path = Path(model_cfg_path)
     if not model_config_path.exists():
         logger.error(f"模型配置文件不存在: {model_config_path}")
         return False
@@ -167,7 +173,7 @@ def verify_model_config() -> bool:
 # ... (前面部分保持不变) ...
 
 def run_experiment_script(experiment_name: str, scene_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    script_path = CTS_ROOT / "experiments" / f"{experiment_name}.py"
+    script_path =Path(CTS_ROOT / "experiments" / f"{experiment_name}.py") 
     if not script_path.exists():
         error_msg = f"实验脚本不存在: {script_path}"
         logger.error(error_msg)
