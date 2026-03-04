@@ -100,11 +100,11 @@ RUN useradd -m ctsuser && \
 RUN pip install --no-cache-dir --upgrade pip \
     -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 5️⃣ 安装 Python 依赖（清华源为主 + 官方 torch 源）
+
 RUN pip install --no-cache-dir \
     --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
     --extra-index-url https://download.pytorch.org/whl/cpu \
-    numpy==2.0.2 \
+    numpy==1.26.4 \
     pandas==2.2.2 \
     scipy==1.12.0 \
     scikit-learn==1.4.2 \
@@ -115,7 +115,6 @@ RUN pip install --no-cache-dir \
     aiohttp==3.9.1 \
     typing-extensions==4.8.0 \
     torch==2.2.2+cpu
-
 # 6️⃣ 切换用户
 USER ctsuser
 
