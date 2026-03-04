@@ -34,7 +34,7 @@ RUN useradd -m ctsuser && \
     chmod -R 755 /cts
 
 # 4. 安装 Python 依赖（全量兼容 NumPy 2.0.2）
-RUN pip install --no-cache-dir --upgrade pip==24.0 -i https://pypi.tuna.tsinghua.edu.cn/simple/ && \
+RUN pip install --no-cache-dir --upgrade pip==24.0 -i https://mirrors.aliyun.com/pypi/simple/ && \
     pip install --no-cache-dir --default-timeout=1000 --retries=5 \
     -i https://mirrors.aliyun.com/pypi/simple/ \
     numpy==2.0.2 && \
@@ -50,7 +50,7 @@ RUN pip install --no-cache-dir --upgrade pip==24.0 -i https://pypi.tuna.tsinghua
     torch==2.0.1+cpu \
     aiohttp==3.9.1 \
     typing-extensions==4.8.0 \
-    matplotlib==3.7.1
+    matplotlib
 
 # 5. 切换用户+环境变量（无修改）
 USER ctsuser
