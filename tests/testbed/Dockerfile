@@ -34,20 +34,16 @@ RUN useradd -m ctsuser && \
     chmod -R 755 /cts
 
 # 4. 安装 Python 依赖（全量兼容 NumPy 2.0.2）
-RUN pip install --no-cache-dir --upgrade pip==24.0 -i https://mirrors.aliyun.com/pypi/simple/ && \
-    # 先装核心：NumPy 2.0.2（匹配模型版本）
+RUN pip install --no-cache-dir --upgrade pip==24.0 -i https://pypi.tuna.tsinghua.edu.cn/simple/ && \
     pip install --no-cache-dir --default-timeout=1000 --retries=5 \
     -i https://mirrors.aliyun.com/pypi/simple/ \
     numpy==2.0.2 && \
-    # 再装所有兼容依赖（一次性升级所有不兼容包）
     pip install --no-cache-dir --default-timeout=1000 --retries=5 \
     -i https://mirrors.aliyun.com/pypi/simple/ \
     --extra-index-url https://download.pytorch.org/whl/cpu \
-    # 无需升级的依赖（保留原版本）
     requests==2.31.0 \
     pyyaml==6.0.1 \
     psutil==5.9.5 \
-    # 需要升级的依赖（核心兼容）
     pandas==2.1.4 \
     scipy==1.11.4 \
     scikit-learn==1.3.2 \
