@@ -245,14 +245,16 @@ def start_experiment_container(scene_name: str, scene_config: Dict, image_name: 
             "docker", "run", "-d", "--name", container_name,
             f"--cpus={scene_config['cpus']}", f"--memory={scene_config['memory']}",
             "--network=host", "--privileged",
-            # 🔧 核心修正：使用绝对路径挂载 tests目录到/cts
+            # 挂载 tests目录到 /cts
             "-v", f"{PROJECT_ROOT}:/cts",  
             # 预压缩文件挂载
             "-v", f"{HOST_PRECOMPRESSED_DATA_DIR}:/cts/data/preprocessed_images",
             "-v", "/var/run/docker.sock:/var/run/docker.sock",  
-            "-e", "PRECOMPRESSED_IMAGES_DIR=/cts/precompressed_images",
+            # 🔧 环境变量（与挂载路径一致）
+            "-e", "PRECOMPRESSED_IMAGES_DIR=/cts/data/preprocessed_images",
             image_name, "sleep", "infinity"
         ]
+
 
         result = subprocess.run(run_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, encoding="utf-8")
         logger.info(f"容器启动成功，命令：{' '.join(run_cmd)}")

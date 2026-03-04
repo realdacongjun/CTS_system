@@ -21,7 +21,7 @@ from typing import Dict, Any, Optional, Tuple
 # 路径配置
 CTS_ROOT = Path(__file__).parent.parent
 SRC_DIR = CTS_ROOT / "src"
-PRECOMPRESSED_DIR = CTS_ROOT / "data" / "preprocessed_images"  # 预压缩文件目录
+PRECOMPRESSED_DIR = Path(os.environ.get("PRECOMPRESSED_IMAGES_DIR", "/cts/data/preprocessed_images"))
 
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
