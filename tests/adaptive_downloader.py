@@ -34,25 +34,29 @@ _ENGINE_CACHE: Optional[Tuple] = None
 # ==========================================
 # 🔧 核心映射：模型决策 algo_name -> 预压缩文件后缀
 # ==========================================
+# ==========================================
+# 🔧 核心映射：模型决策 algo_name -> 预压缩文件后缀
+# ==========================================
 ALGO_TO_PRECOMPRESSED_SUFFIX = {
-    # Gzip 系列
-    "gzip": "gzip-6",
-    "gzip_fast": "gzip-1",
+    # Gzip 系列（直接对应文件名）
+    "gzip-1": "gzip-1",
+    "gzip-6": "gzip-6",
+    "gzip-9": "gzip-9",
     
-    # LZ4 系列
-    "lz4": "lz4-fast",
-    "lz4_high": "lz4-slow",
+    # ZSTD 系列（直接对应文件名）
+    "zstd-1": "zstd-1",
+    "zstd-3": "zstd-3",
+    "zstd-6": "zstd-6",
     
-    # ZSTD 系列
-    "zstd_l1": "zstd-1",
-    "zstd_l3": "zstd-3",
-    "zstd_l5": "zstd-6",
-    "zstd_l9": "zstd-6",
-    "zstd_l12": "zstd-6",
+    # LZ4 系列（直接对应文件名）
+    "lz4-fast": "lz4-fast",
+    "lz4-medium": "lz4-medium",
+    "lz4-slow": "lz4-slow",
     
-    # Brotli 系列
-    "brotli_l4": "brotli-1"
+    # Brotli 系列（直接对应文件名）
+    "brotli-1": "brotli-1"
 }
+
 
 def _get_cts_engine():
     global _ENGINE_CACHE
