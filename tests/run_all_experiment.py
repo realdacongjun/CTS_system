@@ -248,7 +248,7 @@ def start_experiment_container(scene_name: str, scene_config: Dict, image_name: 
             # 🔧 核心修正：使用绝对路径挂载 tests目录到/cts
             "-v", f"{PROJECT_ROOT}:/cts",  
             # 预压缩文件挂载
-            # "-v", f"{HOST_PRECOMPRESSED_DATA_DIR}:/cts/precompressed_images",  
+            "-v", f"{HOST_PRECOMPRESSED_DATA_DIR}:/cts/data/preprocessed_images",
             "-v", "/var/run/docker.sock:/var/run/docker.sock",  
             "-e", "PRECOMPRESSED_IMAGES_DIR=/cts/precompressed_images",
             image_name, "sleep", "infinity"

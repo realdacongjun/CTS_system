@@ -53,7 +53,8 @@ RUN pip install --no-cache-dir --upgrade pip==24.0 -i https://mirrors.aliyun.com
     scikit-learn==1.3.2 \
     torch==2.0.1+cpu \
     aiohttp==3.9.1 \
-    typing-extensions==4.8.0
+    typing-extensions==4.8.0 \
+    matplotlib==3.7.1
 
 # 5. 切换用户+环境变量（无修改）
 USER ctsuser
