@@ -226,13 +226,141 @@ def _run_cts_pipeline(
             pass
         return False, 0.0, str(e)[:200]
 
+# def cts_download(
+#     image_name: str,
+#     strategy: Optional[str] = None,
+#     threads: Optional[int] = None,
+#     env_state: Optional[Dict] = None,
+#     image_features: Optional[Dict] = None,
+#     clear_cache: bool = False
+# ) -> Dict[str, Any]:
+    
+#     start_total = time.perf_counter()
+    
+#     # 0. 清理缓存（默认关闭）
+#     if clear_cache:
+#         try:
+#             subprocess.run(["docker", "rmi", "-f", image_name], 
+#                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+#         except:
+#             pass
+
+#     # 1. 准备特征
+#     if env_state is None:
+#         env_state = _collect_env_state()
+#     if image_features is None:
+#         image_features = _get_image_features(image_name)
+    
+#     # 补充物理特征
+#     img_size = image_features.get('total_size_mb', 100.0)
+#     env_state['theoretical_time'] = img_size / (env_state.get('bandwidth_mbps', 100) / 8 + 1e-8)
+#     env_state['cpu_to_size_ratio'] = env_state.get('cpu_limit', 4.0) / (img_size + 1e-8)
+#     env_state['mem_to_size_ratio'] = env_state.get('mem_limit_mb', 8192) / (img_size + 1e-8)
+#     env_state['network_score'] = env_state.get('bandwidth_mbps', 100) / (env_state.get('network_rtt', 10) + 1e-8)
+
+#     # 2. 决策
+#     final_algo = strategy or "zstd_l3"
+#     final_threads = threads or 4
+#     pred_time = 0.0
+    
+#     if strategy is None:
+#         wrapper, engine = _get_cts_engine()
+#         if engine:
+#             try:
+#                 config_dict, metrics, _ = engine.make_decision(
+#                     env_state=env_state,
+#                     image_features=image_features,
+#                     safety_threshold=0.7
+#                 )
+#                 final_algo = config_dict['algo_name']
+#                 final_threads = config_dict['threads']
+#                 pred_time = metrics.get('pred_time_s', 0.0)
+#                 logger.info(f"🤖 [CTS] AI 决策: {final_algo} @ {final_threads} (Pred: {pred_time:.2f}s)")
+#             except Exception as e:
+#                 logger.warning(f"决策失败，回退默认: {e}")
+#                 final_algo = "zstd_l3"
+#                 final_threads = 4
+
+#     # 3. 执行流程
+#     use_native_pull = (strategy == "baseline") or (strategy == "gzip" and threads == 1)
+    
+#     if use_native_pull:
+#         # 原生模式 (Baseline)
+#         logger.info(f"[Baseline] 执行原生 docker pull...")
+#         t0 = time.time()
+#         try:
+#             result = subprocess.run(
+#                 ["docker", "pull", image_name],
+#                 capture_output=True, text=True, timeout=600
+#             )
+#             if result is None:
+#                 return {
+#                     "strategy": "Baseline",
+#                     "compression": "gzip",
+#                     "threads": 1,
+#                     "image": image_name,
+#                     "time_s": 0,
+#                     "success": False,
+#                     "error": "Docker Pull返回空结果"
+#                 }
+#             if result.returncode == 0:
+#                 total_time = time.time() - t0
+#                 return {
+#                     "strategy": "Baseline",
+#                     "compression": "gzip",
+#                     "threads": 1,
+#                     "image": image_name,
+#                     "time_s": round(total_time, 2),
+#                     "success": True,
+#                     "error": None
+#                 }
+#             else:
+#                 total_time = time.time() - t0
+#                 return {
+#                     "strategy": "Baseline",
+#                     "compression": "gzip",
+#                     "threads": 1,
+#                     "image": image_name,
+#                     "time_s": 0,
+#                     "success": False,
+#                     "error": f"Docker Pull失败: {result.stderr[:200] if result.stderr else '未知错误'}"
+#                 }
+#         except Exception as e:
+#             return {
+#                 "strategy": "Baseline",
+#                 "compression": "gzip",
+#                 "threads": 1,
+#                 "image": image_name,
+#                 "time_s": 0,
+#                 "success": False,
+#                 "error": str(e)[:200]
+#             }
+#     else:
+#         # CTS 模式 (使用预压缩文件)
+#         success, total_time, error = _run_cts_pipeline(image_name, final_algo, final_threads)
+        
+#         return {
+#             "strategy": "CTS",
+#             "compression": final_algo,
+#             "threads": final_threads,
+#             "decision_source": "AI" if strategy is None else "Manual",
+#             "image": image_name,
+#             "time_s": round(total_time, 2),
+#             "pred_time_s": pred_time,
+#             "success": success,
+#             "error": error
+#         }
+
 def cts_download(
     image_name: str,
     strategy: Optional[str] = None,
     threads: Optional[int] = None,
     env_state: Optional[Dict] = None,
     image_features: Optional[Dict] = None,
-    clear_cache: bool = False
+    clear_cache: bool = False,
+    # 🔧 新增参数用于实验对比
+    use_precompressed: bool = True,
+    force_algo: Optional[str] = None
 ) -> Dict[str, Any]:
     
     start_total = time.perf_counter()
@@ -259,11 +387,12 @@ def cts_download(
     env_state['network_score'] = env_state.get('bandwidth_mbps', 100) / (env_state.get('network_rtt', 10) + 1e-8)
 
     # 2. 决策
-    final_algo = strategy or "zstd_l3"
+    final_algo = strategy or "zstd-3"
     final_threads = threads or 4
     pred_time = 0.0
     
-    if strategy is None:
+    # 🔧 如果没有强制指定算法，才使用 AI 决策
+    if force_algo is None and strategy is None:
         wrapper, engine = _get_cts_engine()
         if engine:
             try:
@@ -275,78 +404,29 @@ def cts_download(
                 final_algo = config_dict['algo_name']
                 final_threads = config_dict['threads']
                 pred_time = metrics.get('pred_time_s', 0.0)
-                logger.info(f"🤖 [CTS] AI 决策: {final_algo} @ {final_threads} (Pred: {pred_time:.2f}s)")
+                logger.info(f"🤖 [CTS] AI 决策：{final_algo} @ {final_threads} (Pred: {pred_time:.2f}s)")
             except Exception as e:
-                logger.warning(f"决策失败，回退默认: {e}")
-                final_algo = "zstd_l3"
+                logger.warning(f"决策失败，回退默认：{e}")
+                final_algo = "zstd-3"
                 final_threads = 4
+    elif force_algo is not None:
+        # 🔧 使用强制指定的算法（用于固定策略对比）
+        final_algo = force_algo
+        final_threads = threads or 4
+        logger.info(f"[CTS] 使用固定策略：{final_algo} @ {final_threads}")
 
-    # 3. 执行流程
-    use_native_pull = (strategy == "baseline") or (strategy == "gzip" and threads == 1)
+    # 3. 执行流程（都使用预压缩文件）
+    logger.info(f"[CTS] 使用预压缩文件：{final_algo}...")
+    success, total_time, error = _run_cts_pipeline(image_name, final_algo, final_threads)
     
-    if use_native_pull:
-        # 原生模式 (Baseline)
-        logger.info(f"[Baseline] 执行原生 docker pull...")
-        t0 = time.time()
-        try:
-            result = subprocess.run(
-                ["docker", "pull", image_name],
-                capture_output=True, text=True, timeout=600
-            )
-            if result is None:
-                return {
-                    "strategy": "Baseline",
-                    "compression": "gzip",
-                    "threads": 1,
-                    "image": image_name,
-                    "time_s": 0,
-                    "success": False,
-                    "error": "Docker Pull返回空结果"
-                }
-            if result.returncode == 0:
-                total_time = time.time() - t0
-                return {
-                    "strategy": "Baseline",
-                    "compression": "gzip",
-                    "threads": 1,
-                    "image": image_name,
-                    "time_s": round(total_time, 2),
-                    "success": True,
-                    "error": None
-                }
-            else:
-                total_time = time.time() - t0
-                return {
-                    "strategy": "Baseline",
-                    "compression": "gzip",
-                    "threads": 1,
-                    "image": image_name,
-                    "time_s": 0,
-                    "success": False,
-                    "error": f"Docker Pull失败: {result.stderr[:200] if result.stderr else '未知错误'}"
-                }
-        except Exception as e:
-            return {
-                "strategy": "Baseline",
-                "compression": "gzip",
-                "threads": 1,
-                "image": image_name,
-                "time_s": 0,
-                "success": False,
-                "error": str(e)[:200]
-            }
-    else:
-        # CTS 模式 (使用预压缩文件)
-        success, total_time, error = _run_cts_pipeline(image_name, final_algo, final_threads)
-        
-        return {
-            "strategy": "CTS",
-            "compression": final_algo,
-            "threads": final_threads,
-            "decision_source": "AI" if strategy is None else "Manual",
-            "image": image_name,
-            "time_s": round(total_time, 2),
-            "pred_time_s": pred_time,
-            "success": success,
-            "error": error
-        }
+    return {
+        "strategy": "CTS",
+        "compression": final_algo,
+        "threads": final_threads,
+        "decision_source": "AI" if (force_algo is None and strategy is None) else "Fixed",
+        "image": image_name,
+        "time_s": round(total_time, 2),
+        "pred_time_s": pred_time,
+        "success": success,
+        "error": error
+    }
